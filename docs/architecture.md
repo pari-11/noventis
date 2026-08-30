@@ -88,10 +88,13 @@ writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
 See [protocol-spec.md](protocol-spec.md) -- the source of truth for both
 `protocol.py` modules.
 
-## Deferred / not in this scaffold
+## Deferred
 
-- Alembic migrations.
+- Alembic migrations (`init_db()` runs `create_all` on startup for now).
 - Auth on the API / WebSocket.
 - Multi-process or multi-host fan-out (event bus is in-process only).
 - Downsampling / retention for `raw_frames`.
-- Frontend charting library choice.
+- `edge/sensors/{tof,imu}.py` extraction (`node_tx.py` uses the drivers inline).
+- Multiple simultaneous base stations (`serial_reader` reads one CP2102; a
+  second adapter requires `NODE_PORT_MAP` and today still yields a single reader).
+- Richer charting (the dashboard uses hand-rolled SVG sparklines).

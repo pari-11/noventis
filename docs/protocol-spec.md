@@ -38,16 +38,19 @@ Offset  Size  Field         Notes
 
 ### Stream framing (receiver side)
 
-The serial link is a raw byte stream. The reader (per `base_rx.py`):
+The serial link is a raw byte stream. `protocol.extract_frames(buffer)` (a
+generator, lifted from `base_rx.py`) does the reassembly:
 
-1. Scans the RX buffer for `SYNC` (`AA 55`); discards bytes before it.
+1. Scans the RX buffer for `SYNC` (`AA 55`); discards bytes before it (keeps a
+   lone trailing `AA` in case a `SYNC` is split across two reads).
 2. Waits until at least 6 bytes (the header) are buffered; reads `PAYLOAD_LEN`
    from offset 5.
 3. Waits until `6 + PAYLOAD_LEN + 2` bytes are buffered; that slice is one
-   candidate frame.
-4. Passes the candidate frame to `parse_frame`.
-5. On CRC mismatch: drop that frame and keep scanning from the next byte. Every
-   candidate frame — CRC pass **and** fail — is still logged to `raw_frames`.
+   candidate frame, yielded to the caller and removed from the buffer.
+4. Caller passes each candidate frame to `parse_frame`.
+5. `parse_frame` returns `crc_ok=False` (not an exception) on a bad checksum, so
+   the caller can still log every candidate frame — CRC pass **and** fail — to
+   `raw_frames`.
 
 ---
 
@@ -136,14 +139,21 @@ length mismatch). A CRC failure is **not** an exception — it returns a
 
 ---
 
-## 5. Reference implementations
+## 5. Module API (`edge/protocol.py` == `backend/ingest/protocol.py`)
 
-- Encoder origin: the inline `struct.pack` + `calculate_crc16` in
-  `edge/node_tx.py` (pre-refactor).
-- Decoder origin: `parse_tlv_payload` + the framing loop in
-  `backend/legacy/base_rx.py`.
-- `edge/protocol.py` `__main__` block asserts its output is byte-identical to the
-  original inline construction.
+| Function | Purpose |
+|----------|---------|
+| `crc16(data, crc=0xFFFF)` | CRC-16/CCITT-FALSE; check value `0x29B1` |
+| `encode_tlv(values) -> bytes` | decoded-key dict → TLV payload bytes |
+| `decode_tlv(payload) -> dict` | TLV payload bytes → decoded-key dict |
+| `build_frame(node_id, seq_num, values) -> bytes` | full `SYNC..CRC` packet |
+| `parse_frame(frame) -> DecodedFrame` | one candidate packet → namedtuple (`crc_ok`, `values`, …) |
+| `extract_frames(buffer: bytearray)` | generator: yields complete candidate frames from a growing RX buffer, consuming them in place |
+
+Origins: encoder = inline `struct.pack` + `calculate_crc16` in `edge/node_tx.py`
+(pre-refactor); decoder + `extract_frames` = `parse_tlv_payload` and the framing
+loop in `backend/legacy/base_rx.py`. `edge/protocol.py`'s `__main__` asserts its
+output is byte-identical to the original inline construction.
 
 ---
 

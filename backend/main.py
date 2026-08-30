@@ -1,44 +1,134 @@
 """
 backend/main.py -- Noventis backend, FastAPI application entrypoint.
 
-Wiring (all lifecycle handled in one lifespan context manager):
+Run from the repo root:
 
-  startup:
-    1. db.session.init_db()               -- create_all, WAL pragmas
-    2. start db.writer.run() task         -- subscribes to the event bus
-    3. start ws.manager.run() task        -- subscribes to the event bus
-    4. ingest.serial_reader.start()       -- owns the port, publishes to the bus
-  shutdown (reverse order):
-    serial_reader.stop() -> cancel/await writer + manager tasks -> engine.dispose()
+    uvicorn backend.main:app --reload --port 8000
+
+Lifespan startup, in order:
+  1. init_db()                       -- create_all + WAL pragmas
+  2. DBWriter.start()                -- subscribes to the event bus
+  3. ConnectionManager.start()       -- subscribes to the event bus (independently)
+  4. SerialReader.start()            -- owns the CP2102 port in a background thread;
+                                        publishes frames onto the bus via a
+                                        loop-safe bridge
+
+Shutdown tears them down in reverse and disposes the DB engine.
 
 Routes:
-    GET  /nodes                      api/nodes.py
-    GET  /readings?node_id=...       api/readings.py
-    GET  /raw-frames?node_id=...     api/raw_frames.py
-    WS   /live?node_id=...           ws/manager.py  (omit node_id for all nodes)
+  GET  /health                     -- LoRa port connected? how many nodes seen?
+  GET  /nodes                      -- api/nodes.py
+  GET  /readings?node_id=...       -- api/readings.py
+  GET  /raw-frames?node_id=...     -- api/raw_frames.py
+  WS   /live?node_id=...           -- ws/manager.py (omit node_id for all nodes)
 
-Constraint: nothing in this file (or anything it imports besides
-ingest/serial_reader.py) may import pyserial. The reader owns the port; the DB
-writer and the WS manager only ever see the in-process event bus.
-
-TODO:
-  - [ ] @asynccontextmanager lifespan(app) implementing the sequence above.
-  - [ ] app.include_router(...) for the three REST routers.
-  - [ ] @app.websocket("/live") delegating to ws.manager.
-  - [ ] Config object (env): serial port/baud, DB URL, node timeout, CORS origins.
-  - [ ] CORS for the Vite dev server (http://localhost:5173).
+Only ingest/serial_reader.py touches pyserial; every other component sees the
+in-process event bus.
 """
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Noventis", version="0.0.0")
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select
+
+from .api import nodes, raw_frames, readings
+from .db.models import Node
+from .db.session import SessionLocal, dispose, init_db
+from .db.writer import DBWriter
+from .ingest.event_bus import bus
+from .ingest.serial_reader import (
+    SerialReader,
+    loop_safe_publisher,
+    node_port_map_from_env,
+)
+from .ws.manager import ConnectionManager
+
+logging.basicConfig(
+    level=os.getenv("NOVENTIS_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+log = logging.getLogger("noventis")
+
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("NOVENTIS_CORS_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
 
 
-@app.get("/health")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+
+    writer = DBWriter(bus)
+    ws_manager = ConnectionManager(bus)
+    writer.start()
+    ws_manager.start()
+    await asyncio.sleep(0)  # let both tasks reach bus.subscribe() before frames flow
+
+    reader = SerialReader(
+        publish=loop_safe_publisher(asyncio.get_running_loop(), bus.publish),
+        node_port_map=node_port_map_from_env(),
+    )
+    reader.start()
+
+    app.state.reader = reader
+    app.state.writer = writer
+    app.state.ws_manager = ws_manager
+    log.info("noventis backend started (CORS origins: %s)", CORS_ORIGINS or "none")
+
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(reader.stop)
+        await ws_manager.stop()
+        await writer.stop()
+        await dispose()
+        log.info("noventis backend stopped")
+
+
+app = FastAPI(title="Noventis", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+app.include_router(nodes.router)
+app.include_router(readings.router)
+app.include_router(raw_frames.router)
+
+
+@app.get("/health", tags=["meta"])
 async def health() -> dict:
-    return {"status": "ok"}
+    reader = app.state.reader
+    rstat = reader.status()
+    async with SessionLocal() as session:
+        nodes_seen = (await session.execute(select(func.count()).select_from(Node))).scalar_one()
+    return {
+        "status": "ok",
+        "lora": {
+            "connected": rstat["connected"],
+            "port": rstat["port"],
+            "baud": rstat["baud"],
+            "frames_ok": rstat["frames_ok"],
+            "frames_bad": rstat["frames_bad"],
+            "last_error": rstat["last_error"],
+        },
+        "nodes_seen": nodes_seen,
+        "writer": app.state.writer.status(),
+        "ws": app.state.ws_manager.status(),
+        "bus": bus.status(),
+    }
 
 
-# TODO: lifespan, routers, and the /live websocket -- see module docstring.
+@app.websocket("/live")
+async def live(websocket: WebSocket, node_id: int | None = None) -> None:
+    await app.state.ws_manager.serve(websocket, node_id)

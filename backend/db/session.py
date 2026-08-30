@@ -3,13 +3,14 @@ backend/db/session.py -- async engine, session factory, and schema bootstrap.
 
   - create_async_engine on SQLite via aiosqlite.
   - On every connection: PRAGMA journal_mode=WAL, synchronous=NORMAL,
-    foreign_keys=ON  (WAL lets the writer and the API readers work concurrently).
+    foreign_keys=ON  (WAL lets the ingest writer and the API readers work
+    concurrently without the writer locking out reads).
   - async_sessionmaker(expire_on_commit=False).
-  - init_db(): create_all (no Alembic yet -- constraint #6).
+  - init_db(): Base.metadata.create_all (no Alembic yet -- constraint #6).
+  - dispose(): called from the FastAPI lifespan on shutdown.
 
 TODO:
-  - [ ] Surface pool / timeout tuning if the writer and API contend.
-  - [ ] Add a dispose() hook for the FastAPI lifespan shutdown.
+  - [ ] Pool / busy-timeout tuning if the writer and API ever contend.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from collections.abc import AsyncIterator
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -28,28 +30,38 @@ from .models import Base
 
 DB_URL = os.getenv("NOVENTIS_DB_URL", "sqlite+aiosqlite:///./noventis.db")
 
-engine = create_async_engine(DB_URL, echo=False, future=True)
 
-
-@event.listens_for(engine.sync_engine, "connect")
-def _sqlite_pragmas(dbapi_connection, _connection_record):
+def set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    """WAL + sane durability + FK enforcement, applied on every new connection."""
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 
+def make_engine(url: str = DB_URL) -> AsyncEngine:
+    eng = create_async_engine(url, echo=False)
+    event.listen(eng.sync_engine, "connect", set_sqlite_pragmas)
+    return eng
+
+
+engine: AsyncEngine = make_engine()
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def init_db() -> None:
-    """Create tables if they do not exist. Called from main.py lifespan."""
-    async with engine.begin() as conn:
+async def init_db(target: AsyncEngine | None = None) -> None:
+    """Create tables if they do not exist. Called from main.py's lifespan."""
+    async with (target or engine).begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def dispose() -> None:
+    await engine.dispose()
+
+
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency: yields a session, closes it afterwards."""
+    """FastAPI dependency: yields a session and closes it afterwards."""
     async with SessionLocal() as session:
         yield session

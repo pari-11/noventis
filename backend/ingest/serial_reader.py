@@ -1,53 +1,301 @@
 """
-backend/ingest/serial_reader.py -- owns the pyserial port.
+backend/ingest/serial_reader.py -- owns the LoRa base-station serial port.
 
-This is the ONLY module in the backend allowed to import pyserial or touch the
-serial device. Everything downstream consumes the event bus.
+This is the ONLY backend module that imports pyserial or touches a serial
+device. Everything downstream consumes the event bus.
 
-The pyserial read loop is blocking, so it must NOT run on the FastAPI event loop
-(constraint #3). Run it in a dedicated background thread (or asyncio.to_thread)
-and hand decoded frames back to the loop to publish onto event_bus.bus.
+Design (project constraint #3):
+  * The pyserial read loop is blocking, so it runs in a dedicated background
+    thread -- never on the FastAPI event loop.
+  * The port is NOT hardcoded. On startup (and whenever the port disappears) we
+    scan ``serial.tools.list_ports.comports()`` and pick the CP2102 USB-to-UART
+    adapter by its USB VID:PID ``10C4:EA60`` (per the hand-over guide: the base
+    station is an Ebyte E22 wired to a CP2102).
+      - 0 adapters  -> log "plug it in and restart", keep rescanning every few
+                       seconds (no crash).
+      - 1 adapter   -> use it.
+      - >1 adapters -> log all of them and require NODE_PORT_MAP (config / env
+                       ``NOVENTIS_NODE_PORT_MAP``) to say which one, since we may
+                       run several base stations later.
+  * For every complete candidate frame pulled off the stream we call
+    ``protocol.parse_frame`` and publish a dict to the event bus -- CRC-valid
+    frames decoded, CRC-invalid frames tagged ``crc_ok=False`` (so db.writer can
+    still log them to ``raw_frames``).
 
-Responsibilities:
-  1. Open the serial port (config: NOVENTIS_SERIAL_PORT, NOVENTIS_SERIAL_BAUD).
-  2. Byte-stream reassembly (see docs/protocol-spec.md "Stream framing";
-     backend/legacy/base_rx.py has a working reference loop):
-       - scan for SYNC (0xAA 0x55)
-       - read the 6-byte header, take PAYLOAD_LEN (byte at offset 5)
-       - read PAYLOAD_LEN + 2 more bytes (payload + CRC)
-       - hand the candidate frame to protocol.parse_frame
-  3. Resync on ProtocolError / CRC failure: advance one byte past the bad SYNC.
-  4. Publish an event for EVERY candidate frame -- CRC pass AND fail -- because
-     raw_frames is a forensic log.
-  5. Reconnect with backoff if the port disappears (USB unplug).
+The reader does not import asyncio or the event bus. ``main.py`` injects a
+``publish`` callable that is safe to call from this thread (see
+``loop_safe_publisher`` below).
 
-Public API (driven by main.py lifespan):
-    async def start() -> None      # spins up the reader task/thread
-    async def stop()  -> None      # signals stop, joins, closes the port
+Published event shape (see also ingest/event_bus.py)::
 
-TODO:
-  - [ ] Choose: threading.Thread + loop.call_soon_threadsafe(bus.publish, ...)
-        vs asyncio.to_thread per read. Thread is the safer default for pyserial.
-  - [ ] Implement _frame_scanner(buffer) generator that yields complete candidate
-        frames and keeps the trailing partial bytes.
-  - [ ] Backoff/reconnect loop around serial.Serial(...).
-  - [ ] Build the FrameEvent dict (see event_bus.FrameEvent) and publish it.
-  - [ ] Clean shutdown: stop Event + thread.join(timeout) + ser.close().
-  - [ ] Structured logging: bytes in, frames ok, frames bad, resyncs.
+    {
+      "node_id":     int | None,   # None if the header could not be parsed
+      "seq_num":     int | None,
+      "crc_ok":      bool,
+      "raw":         bytes,        # exact candidate-frame bytes
+      "raw_hex":     str,          # raw.hex(), convenience for JSON / logs
+      "values":      dict,         # decoded TLV keys; {} when crc_ok is False
+      "received_at": datetime,     # timezone-aware UTC, stamped on receipt
+    }
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+from datetime import datetime, timezone
 
-# Defaults match the original base station (base_rx.py): COM4 @ 9600 baud.
-SERIAL_PORT = os.getenv("NOVENTIS_SERIAL_PORT", "COM4")
-SERIAL_BAUD = int(os.getenv("NOVENTIS_SERIAL_BAUD", "9600"))
+import serial
+from serial.tools import list_ports
+
+try:  # package import (normal) / script import (python backend/ingest/serial_reader.py)
+    from .protocol import ProtocolError, extract_frames, parse_frame
+except ImportError:  # pragma: no cover
+    from protocol import ProtocolError, extract_frames, parse_frame
+
+log = logging.getLogger(__name__)
+
+# CP2102 USB-to-UART bridge (Silicon Labs) -- the base-station adapter.
+CP2102_VID = 0x10C4
+CP2102_PID = 0xEA60
+
+DEFAULT_BAUD = int(os.getenv("NOVENTIS_SERIAL_BAUD", "9600"))  # E22 UART is 9600 8N1
+RESCAN_INTERVAL_S = 3.0
+READ_TIMEOUT_S = 0.2
+READ_CHUNK = 4096
 
 
-async def start() -> None:
-    raise NotImplementedError("serial_reader.start(): launch the background read loop")
+class NoAdapterFound(Exception):
+    """No CP2102 adapter is currently connected."""
 
 
-async def stop() -> None:
-    raise NotImplementedError("serial_reader.stop(): signal + join + close the port")
+class AmbiguousAdapters(Exception):
+    """Several CP2102 adapters are connected and NODE_PORT_MAP did not resolve one."""
+
+
+# --------------------------------------------------------------------------- #
+# Port discovery
+# --------------------------------------------------------------------------- #
+def find_cp2102_ports():
+    """Return the list_ports entries whose USB VID:PID is the CP2102."""
+    return [p for p in list_ports.comports() if (p.vid, p.pid) == (CP2102_VID, CP2102_PID)]
+
+
+def _describe(ports):
+    return ", ".join(
+        f"{p.device} (sn={p.serial_number or '?'}, {p.description or '?'})" for p in ports
+    )
+
+
+def select_port(node_port_map=None, override=None):
+    """Decide which serial device to open.
+
+    override        -- explicit device path from NOVENTIS_SERIAL_PORT; bypasses
+                       autodetection entirely (escape hatch for odd setups).
+    node_port_map   -- {serial_number_or_device: label}; only consulted when more
+                       than one CP2102 is present.
+    """
+    if override:
+        return override
+
+    ports = find_cp2102_ports()
+    if not ports:
+        raise NoAdapterFound(
+            "no CP2102 adapter detected (USB 10C4:EA60) -- plug in the LoRa base "
+            "station and restart"
+        )
+    if len(ports) == 1:
+        return ports[0].device
+
+    listing = _describe(ports)
+    if not node_port_map:
+        raise AmbiguousAdapters(
+            f"{len(ports)} CP2102 adapters connected [{listing}]; set NODE_PORT_MAP "
+            "(env NOVENTIS_NODE_PORT_MAP='<serial-or-device>=<label>,...') to choose one"
+        )
+    chosen = [
+        p.device
+        for p in ports
+        if p.device in node_port_map or (p.serial_number in node_port_map)
+    ]
+    if len(chosen) != 1:
+        raise AmbiguousAdapters(
+            f"NODE_PORT_MAP {node_port_map!r} did not resolve to exactly one of [{listing}]"
+        )
+    return chosen[0]
+
+
+def node_port_map_from_env():
+    """Parse NOVENTIS_NODE_PORT_MAP='SERIAL=label,COM7=label' -> dict (or {})."""
+    raw = os.getenv("NOVENTIS_NODE_PORT_MAP", "").strip()
+    mapping = {}
+    for pair in filter(None, (chunk.strip() for chunk in raw.split(","))):
+        key, _, label = pair.partition("=")
+        if key.strip():
+            mapping[key.strip()] = label.strip() or key.strip()
+    return mapping
+
+
+# --------------------------------------------------------------------------- #
+# Reader
+# --------------------------------------------------------------------------- #
+class SerialReader:
+    """Runs the blocking pyserial loop in a background thread and fans decoded
+    frames out through an injected, thread-safe ``publish(event: dict)``."""
+
+    def __init__(self, publish, *, node_port_map=None, baud=DEFAULT_BAUD, port_override=None):
+        self._publish = publish
+        self._node_port_map = dict(node_port_map or {})
+        self._baud = baud
+        self._port_override = port_override or os.getenv("NOVENTIS_SERIAL_PORT") or None
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._port: str | None = None          # open device path, or None when disconnected
+        self._frames_ok = 0
+        self._frames_bad = 0
+        self._last_error: str | None = None
+
+    # -- lifecycle (call from the asyncio side) ----------------------------- #
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="lora-serial-reader", daemon=True)
+        self._thread.start()
+        log.info("serial reader thread started")
+
+    def stop(self, timeout=2.0):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        log.info("serial reader thread stopped")
+
+    # -- status (for GET /health) ---------------------------------------- #
+    @property
+    def connected(self) -> bool:
+        return self._port is not None
+
+    def status(self) -> dict:
+        return {
+            "connected": self.connected,
+            "port": self._port,
+            "baud": self._baud,
+            "frames_ok": self._frames_ok,
+            "frames_bad": self._frames_bad,
+            "last_error": self._last_error,
+        }
+
+    # -- thread body ------------------------------------------------------- #
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                device = select_port(self._node_port_map, self._port_override)
+            except (NoAdapterFound, AmbiguousAdapters) as exc:
+                self._last_error = str(exc)
+                log.warning("%s", exc)
+                self._stop.wait(RESCAN_INTERVAL_S)
+                continue
+
+            try:
+                self._read_from(device)
+            except serial.SerialException as exc:
+                self._last_error = f"{device}: {exc}"
+                log.warning("serial port %s error: %s -- rescanning in %.0fs",
+                            device, exc, RESCAN_INTERVAL_S)
+            except Exception:  # never let the thread die silently
+                log.exception("unexpected serial reader failure -- rescanning in %.0fs",
+                              RESCAN_INTERVAL_S)
+            finally:
+                self._port = None
+            self._stop.wait(RESCAN_INTERVAL_S)
+
+    def _read_from(self, device):
+        log.info("opening LoRa serial port %s @ %d baud (8N1)", device, self._baud)
+        with serial.Serial(
+            device,
+            baudrate=self._baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=READ_TIMEOUT_S,
+        ) as ser:
+            ser.reset_input_buffer()
+            self._port = device
+            self._last_error = None
+            log.info("LoRa base station connected on %s", device)
+
+            buf = bytearray()
+            while not self._stop.is_set():
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting or 1)  # returns within READ_TIMEOUT_S when idle
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                for frame in extract_frames(buf):
+                    self._handle_frame(frame)
+        log.info("closed LoRa serial port %s", device)
+
+    def _handle_frame(self, frame: bytes):
+        received_at = datetime.now(timezone.utc)
+        raw = bytes(frame)
+        node_id = seq_num = None
+        crc_ok = False
+        values: dict = {}
+        try:
+            decoded = parse_frame(raw)
+            node_id, seq_num, crc_ok, values = (
+                decoded.node_id, decoded.seq_num, decoded.crc_ok, decoded.values,
+            )
+        except ProtocolError as exc:
+            # extract_frames should not emit structurally broken slices, but if a
+            # CRC-valid frame carries a malformed TLV, decode raises here.
+            log.debug("frame rejected structurally: %s", exc)
+
+        if crc_ok:
+            self._frames_ok += 1
+        else:
+            self._frames_bad += 1
+
+        self._publish({
+            "node_id": node_id,
+            "seq_num": seq_num,
+            "crc_ok": crc_ok,
+            "raw": raw,
+            "raw_hex": raw.hex(),
+            "values": values,
+            "received_at": received_at,
+        })
+
+
+# --------------------------------------------------------------------------- #
+# Thread -> event-loop bridge (used by main.py to wire this to the event bus)
+# --------------------------------------------------------------------------- #
+def loop_safe_publisher(loop, target):
+    """Wrap ``target(event)`` so the reader thread can call it safely.
+
+    ``target`` is the event bus's synchronous ``publish`` (fan-out to subscriber
+    queues). The returned callable schedules it on ``loop`` via
+    ``call_soon_threadsafe`` and returns immediately.
+    """
+    def _publish(event):
+        loop.call_soon_threadsafe(target, event)
+
+    return _publish
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    _all = list_ports.comports()
+    print(f"{len(_all)} serial port(s):")
+    for _p in _all:
+        _tag = " <- CP2102" if (_p.vid, _p.pid) == (CP2102_VID, CP2102_PID) else ""
+        _vid = f"{_p.vid:04X}" if _p.vid else "----"
+        _pid = f"{_p.pid:04X}" if _p.pid else "----"
+        print(f"  {_p.device:8}  {_vid}:{_pid}  sn={_p.serial_number or '?':16}  {_p.description or ''}{_tag}")
+    try:
+        print("selected:", select_port(node_port_map_from_env(), os.getenv("NOVENTIS_SERIAL_PORT")))
+    except (NoAdapterFound, AmbiguousAdapters) as _exc:
+        print("selected: <none> --", _exc)

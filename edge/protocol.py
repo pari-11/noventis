@@ -24,6 +24,7 @@ except ImportError:  # MicroPython
 
 # ---- Framing ------------------------------------------------------------------
 SYNC = 0xAA55                              # header starts with this, big-endian
+SYNC_BYTES = b"\xaa\x55"                   # SYNC as it appears on the wire
 _HEADER_FMT = ">HBHB"                      # SYNC, NODE_ID, SEQ_NUM, PAYLOAD_LEN
 HEADER_LEN = struct.calcsize(_HEADER_FMT)  # 6
 CRC_LEN = 2
@@ -163,6 +164,38 @@ def parse_frame(frame):
     return DecodedFrame(node_id, seq_num, crc_ok, frame, values)
 
 
+def extract_frames(buffer):
+    """Pull complete candidate frames out of a growing RX byte buffer.
+
+    `buffer` is a bytearray the caller keeps appending serial bytes to. For every
+    complete SYNC..CRC slice this removes those bytes from the front of `buffer`
+    and yields them (as `bytes`); leading garbage is dropped in place and an
+    incomplete trailing frame is left buffered for the next call.
+
+    CRC is NOT checked here -- feed each yielded slice to parse_frame(), which
+    reports crc_ok. This is the resync loop from backend/legacy/base_rx.py,
+    lifted into the shared module.
+    """
+    while True:
+        i = buffer.find(SYNC_BYTES)
+        if i == -1:
+            # No SYNC in view. Keep a trailing 0xAA that might be the first
+            # half of a SYNC split across two reads; drop everything else.
+            keep_tail = buffer[-1:] == SYNC_BYTES[:1]
+            del buffer[:-1 if keep_tail else len(buffer)]
+            return
+        if i:
+            del buffer[:i]
+        if len(buffer) < HEADER_LEN:
+            return  # header still arriving
+        total = HEADER_LEN + buffer[5] + CRC_LEN  # buffer[5] == PAYLOAD_LEN
+        if len(buffer) < total:
+            return  # payload + CRC still arriving
+        frame = bytes(buffer[:total])
+        del buffer[:total]
+        yield frame
+
+
 if __name__ == "__main__":
     # Runs on CPython or MicroPython.
     assert crc16(b"123456789") == 0x29B1, "CRC self-check failed"
@@ -191,4 +224,23 @@ if __name__ == "__main__":
     assert _d.values["accel_mss"] == [int(_ax * 100) / 100,
                                       int(_ay * 100) / 100,
                                       int(_az * 100) / 100], _d.values
+
+    # ToF-only frame (IMU absent) still round-trips.
+    _tof_only = parse_frame(build_frame(2, 1, {"tof_mm": 1500}))
+    assert _tof_only.crc_ok and _tof_only.values == {"tof_mm": 1500}, _tof_only
+
+    # Stream de-framing: garbage + two frames + a partial third.
+    _f2 = build_frame(1, 43, {"tof_mm": 900})
+    _buf = bytearray(b"\x00\x13\xffnoise" + _ours + _f2 + _f2[:5])
+    _got = list(extract_frames(_buf))
+    assert _got == [_ours, _f2], [f.hex() for f in _got]
+    assert bytes(_buf) == _f2[:5], bytes(_buf)  # partial frame stays buffered
+
+    # A CRC-corrupted frame is still returned by extract_frames (parse_frame
+    # then reports crc_ok=False so it can be logged to raw_frames).
+    _bad = bytearray(_ours)
+    _bad[-1] ^= 0xFF
+    _bd = parse_frame(bytes(_bad))
+    assert _bd.crc_ok is False and _bd.values == {}, _bd
+
     print("protocol.py self-test OK (byte-compatible with legacy):", _d.values)

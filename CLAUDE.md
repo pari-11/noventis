@@ -7,24 +7,36 @@ serial; the backend validates, stores, and streams them to a React dashboard.
 Full design and data flow: @docs/architecture.md
 On-wire format (source of truth): @docs/protocol-spec.md
 
-## Project stage: SCAFFOLD
+## Project stage: IMPLEMENTED (end to end)
 
-Most backend and frontend files are intentionally **stubs** -- module docstring +
-TODO list, no implementation. Do not treat missing logic as a bug.
+The full pipeline is built and covered by integration tests
+(`scratchpad/test_layer*.py` while under development):
 
-**Implemented** (small, fully specified, central -- keep them working):
-- `edge/protocol.py` and `backend/ingest/protocol.py` (identical mirror);
-  documents/implements the shipped `0xAA55` frame format
-- `edge/node_tx.py` -- the real production TX script, refactored to import
-  `protocol` instead of inlining TLV/CRC (sensor + LoRa logic untouched)
-- `backend/legacy/base_rx.py` -- the original standalone receiver, kept as the
-  decoder reference (not wired into the FastAPI app)
-- `backend/db/models.py`, `backend/db/session.py`
-- `backend/ingest/event_bus.py`
+    CP2102 serial (thread) -> protocol.parse_frame -> EventBus (fan-out)
+        |-> db.writer  : raw_frames (always) + nodes.last_seen + readings (CRC-ok, idempotent)
+        `-> ws.manager : JSON push to /live clients (CRC-ok only), node_id-filtered
 
-**Stubbed** (fill in when asked): `edge/sensors/*`, `backend/main.py`,
-`backend/ingest/serial_reader.py`, `backend/db/writer.py`,
-`backend/ws/manager.py`, `backend/api/*`, all of `frontend/src/*`.
+- `edge/protocol.py` == `backend/ingest/protocol.py` -- TLV + CRC-16-CCITT codec
+  for the shipped `0xAA55` frame format, plus `extract_frames` stream de-framer
+- `edge/node_tx.py` -- real production TX script, importing `protocol`
+- `backend/legacy/base_rx.py` -- original standalone receiver, kept as the
+  decoder reference (NOT imported by the app)
+- `backend/ingest/serial_reader.py` -- CP2102 autodetect by USB VID:PID
+  `10C4:EA60`, background thread, rescans when absent, never hardcodes a port
+- `backend/ingest/event_bus.py` -- sync `publish()` / async `subscribe()` fan-out
+- `backend/db/{models,session,writer}.py` -- async SQLAlchemy, SQLite WAL,
+  `INSERT ... ON CONFLICT DO NOTHING` on `(node_id, seq_num)`
+- `backend/ws/manager.py` -- `/live` connection registry + broadcast loop
+- `backend/api/{nodes,readings,raw_frames}.py` -- the REST routers
+- `backend/main.py` -- lifespan wiring + `/health`
+- `frontend/src/*` -- `useWebSocket` (backoff reconnect), `NodeSelector`,
+  `LiveChart` (dependency-free SVG sparklines), `HistoryPanel`, `App`
+
+**Still stubbed:** `edge/sensors/{tof,imu}.py` (node_tx talks to the drivers
+directly today; these are extraction targets).
+
+Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
+`frontend/`. No Alembic -- `init_db()` runs `create_all` on startup.
 
 ## Non-negotiable constraints (do not re-litigate without asking)
 

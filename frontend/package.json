@@ -18,6 +18,5 @@
     "@vitejs/plugin-react": "^4.3.1",
     "typescript": "^5.5.3",
     "vite": "^5.3.4"
-  },
-  "comment:charting": "TODO pick a charting lib for LiveChart/HistoryPanel (e.g. recharts, uplot, visx) and add it here."
+  }
 }

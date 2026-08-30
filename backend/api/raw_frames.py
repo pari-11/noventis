@@ -1,28 +1,58 @@
 """
-backend/api/raw_frames.py -- REST: GET /raw-frames?node_id=...
+backend/api/raw_frames.py -- REST: GET /raw-frames?node_id=&crc_ok=&limit=
 
 Forensic access to the raw_frames log -- every candidate frame received, CRC
-pass or fail. node_id filter is OPTIONAL because unparseable headers are stored
-with node_id = NULL.
+pass or fail. Primarily for debugging CRC failures.
 
-Query params:
-    node_id   (optional)  int
-    crc_ok    (optional)  bool -- filter to only-valid or only-invalid
-    since / until (optional)  ISO-8601
-    limit     (optional)  int, default 200, max 2000
-
-Response item:
-    { "id": ..., "node_id": 1|null, "received_at": ..., "crc_ok": false,
-      "raw_hex": "aa550100 2a ..." }
-
-TODO:
-  - [ ] APIRouter; GET "/raw-frames" (note: path uses a hyphen).
-  - [ ] Build filters conditionally from the provided params.
-  - [ ] Encode `raw` bytes -> hex string in the response.
-  - [ ] Newest-first, limit-bounded; keyset pagination for deep scans.
+  node_id  (optional)  int   -- omit to include frames with an unparseable header (node_id NULL)
+  crc_ok   (optional)  bool  -- e.g. ?crc_ok=false to see only corrupt frames
+  limit    (optional)  1..2000, default 200
 """
 
 from __future__ import annotations
 
-# from fastapi import APIRouter, Depends, Query
-# router = APIRouter(tags=["raw-frames"])
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..db.models import RawFrame
+from ..db.session import get_session
+
+router = APIRouter(tags=["raw-frames"])
+
+
+class RawFrameOut(BaseModel):
+    id: int
+    node_id: int | None
+    received_at: datetime
+    crc_ok: bool
+    raw_hex: str
+
+
+@router.get("/raw-frames", response_model=list[RawFrameOut])
+async def list_raw_frames(
+    node_id: int | None = None,
+    crc_ok: bool | None = None,
+    limit: int = Query(200, ge=1, le=2000),
+    session: AsyncSession = Depends(get_session),
+) -> list[RawFrameOut]:
+    stmt = select(RawFrame)
+    if node_id is not None:
+        stmt = stmt.where(RawFrame.node_id == node_id)
+    if crc_ok is not None:
+        stmt = stmt.where(RawFrame.crc_ok.is_(crc_ok))
+    stmt = stmt.order_by(RawFrame.received_at.desc(), RawFrame.id.desc()).limit(limit)
+    rows = (await session.execute(stmt)).scalars().all()
+    return [
+        RawFrameOut(
+            id=r.id,
+            node_id=r.node_id,
+            received_at=r.received_at,
+            crc_ok=r.crc_ok,
+            raw_hex=r.raw.hex(),
+        )
+        for r in rows
+    ]

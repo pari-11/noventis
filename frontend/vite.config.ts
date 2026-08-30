@@ -12,6 +12,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      '/health': 'http://localhost:8000',
       '/nodes': 'http://localhost:8000',
       '/readings': 'http://localhost:8000',
       '/raw-frames': 'http://localhost:8000',

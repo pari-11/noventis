@@ -30,6 +30,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    TypeDecorator,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -37,6 +38,31 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class UtcDateTime(TypeDecorator):
+    """Timezone-aware UTC datetimes over SQLite.
+
+    SQLite has no native tz type, so a plain ``DateTime(timezone=True)`` column
+    silently hands back *naive* datetimes on read. This decorator stores naive
+    UTC and re-attaches ``timezone.utc`` on the way out, so the whole app (and
+    the JSON API) always sees aware UTC.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -50,7 +76,7 @@ class Node(Base):
 
     node_id: Mapped[int] = mapped_column(Integer, primary_key=True)  # protocol NODE_ID (uint8)
     last_seen: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
     # status ("online"/"offline") is derived from last_seen at read time -- see
     # api/nodes.py. It is deliberately NOT a column.
@@ -64,7 +90,7 @@ class RawFrame(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     node_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     received_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+        UtcDateTime, default=utcnow, nullable=False, index=True
     )
     crc_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
     raw: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)  # exact wire bytes
@@ -79,7 +105,7 @@ class Reading(Base):
     node_id: Mapped[int] = mapped_column(Integer, nullable=False)
     seq_num: Mapped[int] = mapped_column(Integer, nullable=False)  # uint16 from header
     timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
+        UtcDateTime, default=utcnow, nullable=False
     )
 
     # Decoded TLV values -- see docs/protocol-spec.md section 3.
