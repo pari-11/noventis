@@ -1,0 +1,8 @@
+# Noventis backend dependencies.
+
+fastapi>=0.111
+uvicorn[standard]>=0.30
+sqlalchemy[asyncio]>=2.0
+aiosqlite>=0.20
+pyserial>=3.5          # imported ONLY by backend/ingest/serial_reader.py
+pydantic>=2.7

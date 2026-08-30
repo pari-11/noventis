@@ -1,0 +1,13 @@
+# Edge node runtime dependencies.
+#
+# Adjust to match your board and your production node_tx.py. If the node runs
+# MicroPython, this file is not used -- protocol.py is stdlib-only and
+# MicroPython-safe by design (uses ucollections.namedtuple fallback).
+#
+# CPython (Raspberry Pi class) baseline:
+pyserial>=3.5          # only if node_tx.py talks to the LoRa module over UART
+
+# Sensor driver libraries used by sensors/tof.py and sensors/imu.py -- pin the
+# ones your production script actually imports, e.g.:
+# adafruit-circuitpython-vl53l1x
+# adafruit-circuitpython-lsm6ds
