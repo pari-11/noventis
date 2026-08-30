@@ -106,10 +106,13 @@ class DBWriter:
                         )
                     )
 
-                # 3. decoded reading -- CRC-valid only, idempotent on (node_id, seq_num)
+                # 3. decoded reading -- CRC-valid frames that actually carried
+                #    decoded values; idempotent on (node_id, seq_num). Empty-payload
+                #    keepalive frames update last_seen (above) but are not readings.
+                values = event["values"]
+                store_reading = event["crc_ok"] and node_id is not None and bool(values)
                 inserted_reading = False
-                if event["crc_ok"] and node_id is not None:
-                    values = event["values"]
+                if store_reading:
                     ax, ay, az = values.get("accel_mss") or _NONE3
                     gx, gy, gz = values.get("gyro_rads") or _NONE3
                     result = await session.execute(
@@ -128,7 +131,7 @@ class DBWriter:
 
         # counters updated after the transaction commits cleanly
         self._raw_written += 1
-        if event["crc_ok"] and node_id is not None:
+        if store_reading:
             if inserted_reading:
                 self._readings_written += 1
             else:
