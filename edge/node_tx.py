@@ -49,9 +49,15 @@ def wait_for_radio_idle(timeout=2.0):
 # --- Initialize Peripherals ---
 i2c = busio.I2C(board.SCL, board.SDA)
 
-# 1. Initialize ToF Sensor
-vl53 = adafruit_vl53l0x.VL53L0X(i2c)
-vl53.measurement_timing_budget = 33000
+# 1. Initialize ToF Sensor (Graceful Fallback -- mirrors the IMU handling below;
+#    a wedged / unwired VL53L0X must not stop the node transmitting).
+try:
+    vl53 = adafruit_vl53l0x.VL53L0X(i2c)
+    vl53.measurement_timing_budget = 33000
+    print("[INIT] VL53L0X ToF detected at 0x29.")
+except Exception as e:
+    vl53 = None
+    print(f"[INIT] VL53L0X not available ({e}). Transmitting without ToF.")
 
 # 2. Attempt IMU Initialization (Graceful Fallback)
 imu = None
@@ -70,14 +76,15 @@ seq_num = 0
 try:
     while True:
         readings = {}
+        distance_mm = None
 
         # --- TLV Tag 0x01: ToF Sensor ---
-        try:
-            distance_mm = vl53.range
-            readings["tof_mm"] = distance_mm
-        except Exception as e:
-            distance_mm = None
-            print(f"ToF Read Error: {e}")
+        if vl53 is not None:
+            try:
+                distance_mm = vl53.range
+                readings["tof_mm"] = distance_mm
+            except Exception as e:
+                print(f"ToF Read Error: {e}")
 
         # --- TLV Tag 0x02: IMU 6-Axis (Accel + Gyro) ---
         if imu is not None:
