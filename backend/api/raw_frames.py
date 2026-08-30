@@ -12,8 +12,8 @@ Query params:
     limit     (optional)  int, default 200, max 2000
 
 Response item:
-    { "id": ..., "node_id": 7|null, "received_at": ..., "crc_ok": false,
-      "raw_hex": "4e56011a..." }
+    { "id": ..., "node_id": 1|null, "received_at": ..., "crc_ok": false,
+      "raw_hex": "aa550100 2a ..." }
 
 TODO:
   - [ ] APIRouter; GET "/raw-frames" (note: path uses a hyphen).

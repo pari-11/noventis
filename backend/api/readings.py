@@ -11,7 +11,9 @@ Query params:
     limit     (optional)  int, default 200, max 2000
 
 Response item mirrors the readings columns / docs/protocol-spec.md section 3:
-    { "seq_num": ..., "timestamp": ..., "tof_dist_mm": ..., "accel_mg": [...], ... }
+    { "seq_num": ..., "timestamp": ..., "tof_mm": ...,
+      "accel_x": ..., "accel_y": ..., "accel_z": ...,
+      "gyro_x": ..., "gyro_y": ..., "gyro_z": ... }
 
 TODO:
   - [ ] APIRouter; GET "/readings".

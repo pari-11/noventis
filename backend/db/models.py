@@ -14,9 +14,9 @@ Three tables (see docs/architecture.md "Data model"):
               UNIQUE (node_id, seq_num) makes re-ingestion idempotent.
 
 TODO:
-  - [ ] Decide IMU storage: JSON list columns (below) vs six int columns.
   - [ ] Add a retention/rollup story for raw_frames (it grows fast).
   - [ ] Confirm node_id domain: protocol NODE_ID is uint8 (1..254).
+  - [ ] Store raw int16 fixed-point instead of decoded floats? (lossless replay)
 """
 
 from __future__ import annotations
@@ -24,10 +24,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    JSON,
-    BigInteger,
     Boolean,
     DateTime,
+    Float,
     Index,
     Integer,
     LargeBinary,
@@ -83,14 +82,16 @@ class Reading(Base):
         DateTime(timezone=True), default=utcnow, nullable=False
     )
 
-    # Decoded TLV values -- keys mirror docs/protocol-spec.md section 3.
-    uptime_ms: Mapped[int | None] = mapped_column(BigInteger)
-    vbat_mv: Mapped[int | None] = mapped_column(Integer)
-    tof_dist_mm: Mapped[int | None] = mapped_column(Integer)
-    tof_status: Mapped[int | None] = mapped_column(Integer)
-    accel_mg: Mapped[list | None] = mapped_column(JSON)   # [x, y, z] milli-g
-    gyro_cdps: Mapped[list | None] = mapped_column(JSON)  # [x, y, z] centi-deg/s
-    imu_temp_cc: Mapped[int | None] = mapped_column(Integer)
+    # Decoded TLV values -- see docs/protocol-spec.md section 3.
+    # Flat float columns (not JSON) to mirror base_rx.py's proven schema and keep
+    # per-axis filtering/aggregation cheap in SQLite.
+    tof_mm: Mapped[int | None] = mapped_column(Integer)          # tag 0x01, millimetres
+    accel_x: Mapped[float | None] = mapped_column(Float)         # tag 0x02, m/s^2
+    accel_y: Mapped[float | None] = mapped_column(Float)
+    accel_z: Mapped[float | None] = mapped_column(Float)
+    gyro_x: Mapped[float | None] = mapped_column(Float)          # tag 0x02, rad/s
+    gyro_y: Mapped[float | None] = mapped_column(Float)
+    gyro_z: Mapped[float | None] = mapped_column(Float)
 
     __table_args__ = (
         UniqueConstraint("node_id", "seq_num", name="uq_readings_node_seq"),

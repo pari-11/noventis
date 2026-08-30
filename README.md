@@ -5,8 +5,10 @@ and transmit TLV-encoded frames over LoRa. A gateway radio delivers frames to a
 host over USB serial; a FastAPI backend validates, stores, and streams them; a
 React dashboard shows live and historical data.
 
-> **Status: scaffold.** `protocol.py` (edge + backend), the DB models/session,
-> and the event bus are implemented. Everything else is a documented stub with
+> **Status: scaffold.** Implemented: `protocol.py` (edge + backend, identical),
+> the production `edge/node_tx.py` (refactored onto `protocol`), the original
+> `backend/legacy/base_rx.py` receiver (kept as decoder reference), the DB
+> models/session, and the event bus. Everything else is a documented stub with
 > TODOs. See [CLAUDE.md](CLAUDE.md) for the constraints and what's done.
 
 ## Layout
@@ -48,8 +50,8 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Config via environment: `NOVENTIS_SERIAL_PORT` (default `COM3`),
-`NOVENTIS_SERIAL_BAUD` (`115200`), `NOVENTIS_DB_URL`
+Config via environment: `NOVENTIS_SERIAL_PORT` (default `COM4`, matching the
+original `base_rx.py`), `NOVENTIS_SERIAL_BAUD` (`9600`), `NOVENTIS_DB_URL`
 (`sqlite+aiosqlite:///./noventis.db`).
 
 ### Frontend (dev)

@@ -18,7 +18,8 @@ TODO:
         keep up. WAL mode makes single-writer commits cheap-ish.
   - [ ] Error isolation: a malformed event must be logged and skipped, never
         kill the loop.
-  - [ ] Map event["values"] keys -> Reading columns (they already match).
+  - [ ] Map event["values"] -> Reading columns: `tof_mm` direct; flatten
+        `accel_mss` -> accel_x/y/z and `gyro_rads` -> gyro_x/y/z.
 """
 
 from __future__ import annotations

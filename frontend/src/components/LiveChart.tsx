@@ -6,13 +6,13 @@
  *
  * Consumes useWebSocket(nodeId); appends each LiveMessage to a bounded, rolling
  * window (e.g. last 5 min or last N points) and renders one line per metric
- * (tof_dist_mm, |accel|, etc.).
+ * (tof_mm, |accel|, etc.).
  *
  * TODO:
  *  - [ ] pick a charting lib (see frontend/package.json) and add it
  *  - [ ] rolling buffer with a max length; drop oldest
  *  - [ ] metric selector (which decoded keys to plot)
- *  - [ ] derive scalar magnitudes from accel_mg / gyro_cdps vectors
+ *  - [ ] derive scalar magnitudes from accel_mss / gyro_rads vectors
  *  - [ ] pause-on-hover / "live" toggle
  */
 

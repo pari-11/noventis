@@ -42,12 +42,16 @@ dashboard shows live and historical data.
 ## Data flow
 
 ```
-serial bytes
+serial bytes  (0xAA55-framed; see protocol-spec.md)
   -> serial_reader: resync on SYNC, slice candidate frame, parse_frame()
   -> event_bus.publish(FrameEvent{ raw, crc_ok, node_id, seq_num, values, received_at })
        |-> db.writer   : INSERT raw_frames; if crc_ok -> UPSERT node, INSERT reading (idempotent)
        `-> ws.manager  : if crc_ok -> JSON to matching /live clients
 ```
+
+`values` holds the decoded keys `tof_mm`, `accel_mss`, `gyro_rads`
+(see protocol-spec.md §3); `db.writer` flattens the vectors into the
+`accel_{x,y,z}` / `gyro_{x,y,z}` columns.
 
 `db.writer` and `ws.manager` subscribe **independently**. Neither imports
 pyserial or touches the port. If one is slow or crashes, the other is unaffected.
@@ -58,7 +62,7 @@ pyserial or touches the port. If one is slow or crashes, the other is unaffected
 |--------------|--------------------------------|--------------------------------------------------------------|-------------|
 | `nodes`      | known nodes                    | `node_id` PK, `last_seen`                                     | `status` computed on read, never stored |
 | `raw_frames` | forensic log of every packet   | `id` PK, `node_id` (nullable), `received_at`, `crc_ok`, `raw` | index on `received_at`, `node_id` |
-| `readings`   | CRC-valid decoded values only  | `id` PK, `node_id`, `seq_num`, `timestamp`, decoded columns   | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
+| `readings`   | CRC-valid decoded values only  | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
 
 The unique `(node_id, seq_num)` constraint makes re-ingestion (replaying a serial
 capture, restarting the reader) idempotent -- duplicate readings are dropped with

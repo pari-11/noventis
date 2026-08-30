@@ -13,10 +13,10 @@ Responsibilities:
 
 Outbound message shape (keys mirror docs/protocol-spec.md section 3):
     {
-      "node_id": 7,
+      "node_id": 1,
       "seq_num": 4211,
       "ts": "2026-08-30T12:34:56.789Z",
-      "values": { "tof_dist_mm": 812, "accel_mg": [.,.,.], ... }
+      "values": { "tof_mm": 812, "accel_mss": [x, y, z], "gyro_rads": [x, y, z] }
     }
 
 TODO:

@@ -1,36 +1,36 @@
 """
-edge/sensors/imu.py -- Inertial Measurement Unit driver wrapper.
+edge/sensors/imu.py -- Inertial Measurement Unit wrapper.
 
-Responsibility: own the IMU and expose a small, board-agnostic read API to
-`node_tx.py`. Vendor driver stays behind this wrapper.
+Responsibility: own the IMU and expose a small, board-agnostic read API. Right
+now node_tx.py talks to `adafruit_mpu6050` directly (with a graceful fallback to
+ToF-only mode when the driver or chip is absent); that should move here.
 
-Expected API (consumed by node_tx.py), all integers, ready for TLV packing:
-    init() -> None
-    read_accel_mg()  -> [x, y, z]   # acceleration, milli-g          (TAG_IMU_ACCEL_MG  0x20)
-    read_gyro_cdps() -> [x, y, z]   # angular rate, centi-deg/second  (TAG_IMU_GYRO_CDPS 0x21)
-    read_temp_cc()   -> int         # die temperature, centi-deg C    (TAG_IMU_TEMP_CC   0x22)
+Expected API (to be consumed by node_tx.py):
+    init() -> bool                     # True if an IMU was found (fallback-friendly)
+    read_accel_mss() -> (x, y, z)      # acceleration, m/s^2   -> protocol key "accel_mss"
+    read_gyro_rads() -> (x, y, z)      # angular rate, rad/s   -> protocol key "gyro_rads"
 
-Values are int16 on the wire -- callers/driver must keep them in [-32768, 32767].
+Both map to the single protocol tag TAG_IMU_6AXIS (0x02). The fixed-point
+scaling (accel * 100, gyro * 1000, int16) is done in protocol.encode_tlv, NOT
+here -- this wrapper returns physical floats straight from the driver
+(`imu.acceleration`, `imu.gyro`). See docs/protocol-spec.md section 3.
+
+There is no temperature tag in the current wire protocol.
 
 TODO:
-  - [ ] Confirm the IMU part (e.g. LSM6DS3 / MPU-6050 / ICM-20948) and driver lib.
-  - [ ] init(): I2C/SPI setup, output data rate, full-scale ranges.
-  - [ ] Convert raw LSBs -> milli-g / centi-deg-per-s here (not in node_tx.py).
-  - [ ] Extract from the production script if that conversion already exists there.
+  - [ ] Move the MPU6050 init + graceful-fallback logic here from node_tx.py.
+  - [ ] init(): I2C, address 0x68, return False instead of raising when absent.
+  - [ ] Keep axis values within int16 after scaling (protocol asserts range).
 """
 
 
 def init():
-    raise NotImplementedError("imu.init(): wire up the real IMU driver")
+    raise NotImplementedError("imu.init(): move the MPU6050 setup + fallback here")
 
 
-def read_accel_mg():
-    raise NotImplementedError("imu.read_accel_mg(): return [x, y, z] in milli-g")
+def read_accel_mss():
+    raise NotImplementedError("imu.read_accel_mss(): return imu.acceleration (x, y, z) m/s^2")
 
 
-def read_gyro_cdps():
-    raise NotImplementedError("imu.read_gyro_cdps(): return [x, y, z] in centi-deg/s")
-
-
-def read_temp_cc():
-    raise NotImplementedError("imu.read_temp_cc(): return die temp in centi-deg C")
+def read_gyro_rads():
+    raise NotImplementedError("imu.read_gyro_rads(): return imu.gyro (x, y, z) rad/s")

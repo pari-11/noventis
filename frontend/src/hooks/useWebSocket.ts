@@ -18,11 +18,17 @@
  *  - [ ] optional ring buffer of the last N messages instead of just the last
  */
 
+// values keys per docs/protocol-spec.md section 3:
+//   tof_mm: number | gyro_rads: [x,y,z] | accel_mss: [x,y,z]
 export type LiveMessage = {
   node_id: number
   seq_num: number
   ts: string
-  values: Record<string, number | number[]>
+  values: {
+    tof_mm?: number
+    accel_mss?: [number, number, number]
+    gyro_rads?: [number, number, number]
+  }
 }
 
 export type WsStatus = 'idle' | 'connecting' | 'open' | 'closed'

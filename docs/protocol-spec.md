@@ -1,11 +1,15 @@
 # Noventis Wire Protocol Specification
 
-**Protocol version:** `0x01`
-
 **Status:** This document is the **single source of truth** for the on-wire
-format. Both `edge/protocol.py` and `backend/ingest/protocol.py` implement it and
-**must stay byte-for-byte identical** to each other. Any change to tags or byte
-layout is made here **and** in both modules, in the same commit.
+format. It documents the format that the production firmware
+(`edge/node_tx.py`) and the original base-station receiver
+(`backend/legacy/base_rx.py`) already speak. Both `edge/protocol.py` and
+`backend/ingest/protocol.py` implement it and **must stay byte-for-byte
+identical** to each other. Any change to framing or tags is made here **and** in
+both modules, in the same commit.
+
+There is **no protocol version byte on the wire** (see §6). "Version" below
+refers only to this document's revision.
 
 ---
 
@@ -17,38 +21,40 @@ two's complement.
 ```
 Offset  Size  Field         Notes
 ------  ----  ------------  ----------------------------------------------------
-0       2     SYNC          0x4E 0x56  ("NV")  -- not covered by CRC
-2       1     VERSION       0x01
-3       1     NODE_ID       1..254   (0x00 and 0xFF reserved / invalid)
-4       2     SEQ_NUM       uint16, monotonic per node, wraps 0xFFFF -> 0x0000
-6       1     PAYLOAD_LEN   number of bytes in PAYLOAD (0..255)
-7       N     PAYLOAD       N == PAYLOAD_LEN bytes of concatenated TLV triples
-7+N     2     CRC16         CRC-16/CCITT-FALSE over VERSION .. last PAYLOAD byte
+0       2     SYNC          0xAA55  (bytes: AA 55)   -- covered by CRC
+2       1     NODE_ID       1..254
+3       2     SEQ_NUM       uint16, monotonic per node, wraps 0xFFFF -> 0x0000
+5       1     PAYLOAD_LEN   number of bytes in PAYLOAD (0..255)
+6       N     PAYLOAD       N == PAYLOAD_LEN bytes of concatenated TLV records
+6+N     2     CRC16         CRC-16/CCITT-FALSE over offsets 0 .. (6+N-1)
 ```
 
-- **Minimum frame size:** 9 bytes (empty payload).
-- **Maximum frame size:** 7 + 255 + 2 = 264 bytes.
-- **CRC coverage:** offsets `2 .. (7 + N - 1)` inclusive — i.e. everything
-  between `SYNC` and `CRC16`. `SYNC` itself is **not** covered (it is only a
-  stream-resynchronisation marker).
+- Header struct format: `>HBHB` (6 bytes).
+- **Minimum frame size:** 8 bytes (empty payload).
+- **Maximum frame size:** 6 + 255 + 2 = 263 bytes.
+- **CRC coverage:** the entire frame **except the 2 CRC bytes themselves** — i.e.
+  `SYNC + header + payload`. Unlike many designs, `SYNC` **is** included in the
+  CRC here, matching the production firmware.
 
 ### Stream framing (receiver side)
 
-The serial link is a raw byte stream. The reader:
+The serial link is a raw byte stream. The reader (per `base_rx.py`):
 
-1. Scans for the 2-byte `SYNC`.
-2. Reads the 7-byte header, takes `PAYLOAD_LEN`.
-3. Reads `PAYLOAD_LEN + 2` more bytes (payload + CRC).
-4. Passes the whole candidate frame to `parse_frame`.
-5. On bad sync / length / CRC: advances **one byte** past the failed `SYNC` and
-   keeps scanning (resync). Every candidate frame — CRC pass **and** fail — is
-   still logged to `raw_frames`.
+1. Scans the RX buffer for `SYNC` (`AA 55`); discards bytes before it.
+2. Waits until at least 6 bytes (the header) are buffered; reads `PAYLOAD_LEN`
+   from offset 5.
+3. Waits until `6 + PAYLOAD_LEN + 2` bytes are buffered; that slice is one
+   candidate frame.
+4. Passes the candidate frame to `parse_frame`.
+5. On CRC mismatch: drop that frame and keep scanning from the next byte. Every
+   candidate frame — CRC pass **and** fail — is still logged to `raw_frames`.
 
 ---
 
 ## 2. CRC-16
 
-**Algorithm:** CRC-16/CCITT-FALSE
+**Algorithm:** CRC-16/CCITT-FALSE (identical to `calculate_crc16()` in the
+original `node_tx.py` / `base_rx.py`).
 
 | Parameter        | Value   |
 |------------------|---------|
@@ -59,47 +65,56 @@ The serial link is a raw byte stream. The reader:
 | Final XOR        | `0x0000` |
 | Check (`"123456789"`) | `0x29B1` |
 
+Transmitted as a 2-byte big-endian value appended after the payload.
+
 ---
 
 ## 3. TLV payload
 
-The payload is zero or more TLV triples:
+The payload is zero or more TLV records:
 
 ```
 TAG (1 byte) | LEN (1 byte) | VALUE (LEN bytes)
 ```
 
 - **Unknown tags MUST be skipped** using `LEN` (forward compatibility).
-- **Duplicate tags:** last occurrence wins.
-- Tags are emitted by the encoder in ascending tag order for deterministic
-  frames, but decoders must not rely on ordering.
+- A record whose `LEN` does not match the expected length for a known tag is
+  skipped (treated as unknown).
+- Duplicate tags: last occurrence wins.
+- The encoder emits ToF (`0x01`) before IMU (`0x02`); decoders must not rely on
+  ordering.
 
 ### Tag table
 
-| Tag    | Name                | Len | Value encoding      | Units / meaning                              |
-|--------|---------------------|-----|---------------------|----------------------------------------------|
-| `0x01` | `TAG_UPTIME_MS`     | 4   | `uint32`            | milliseconds since node boot                 |
-| `0x02` | `TAG_VBAT_MV`       | 2   | `uint16`            | battery voltage, millivolts                  |
-| `0x10` | `TAG_TOF_DIST_MM`   | 2   | `uint16`            | ToF distance, mm (`0xFFFF` = out of range)   |
-| `0x11` | `TAG_TOF_STATUS`    | 1   | `uint8`             | ToF range-status code (sensor-specific)      |
-| `0x20` | `TAG_IMU_ACCEL_MG`  | 6   | `3 x int16` (x,y,z) | acceleration, milli-g                        |
-| `0x21` | `TAG_IMU_GYRO_CDPS` | 6   | `3 x int16` (x,y,z) | angular rate, centi-degrees/second           |
-| `0x22` | `TAG_IMU_TEMP_CC`   | 2   | `int16`             | IMU die temperature, centi-degrees Celsius   |
+| Tag    | Name           | Len | Value encoding                          | Meaning                                  |
+|--------|----------------|-----|-----------------------------------------|------------------------------------------|
+| `0x01` | `TAG_TOF`      | 2   | `uint16`                                | ToF distance, millimetres                |
+| `0x02` | `TAG_IMU_6AXIS`| 12  | `6 x int16` = `ax, ay, az, gx, gy, gz`  | accelerometer + gyroscope, fixed-point   |
+
+### Fixed-point scaling (tag `0x02`)
+
+| Axis group | Wire value                     | Decoded value            | Physical unit |
+|------------|--------------------------------|--------------------------|---------------|
+| accel `ax,ay,az` | `int(value_mss * 100)`   | `wire / 100`             | m/s^2         |
+| gyro  `gx,gy,gz` | `int(value_rads * 1000)` | `wire / 1000`            | rad/s         |
+
+The encoder **truncates toward zero** (`int(...)`, not round-half) to match the
+production firmware exactly. Each scaled axis must fit in `int16`
+(`-32768..32767`); the driver wrappers are responsible for staying in range.
 
 ### Decoded value keys
 
 These key names are used everywhere downstream — on the event bus, in the
 `readings` table, and in WebSocket JSON messages:
 
-| Key            | Type        | From tag              |
-|----------------|-------------|-----------------------|
-| `uptime_ms`    | int         | `TAG_UPTIME_MS`       |
-| `vbat_mv`      | int         | `TAG_VBAT_MV`         |
-| `tof_dist_mm`  | int         | `TAG_TOF_DIST_MM`     |
-| `tof_status`   | int         | `TAG_TOF_STATUS`      |
-| `accel_mg`     | `[x, y, z]` | `TAG_IMU_ACCEL_MG`    |
-| `gyro_cdps`    | `[x, y, z]` | `TAG_IMU_GYRO_CDPS`   |
-| `imu_temp_cc`  | int         | `TAG_IMU_TEMP_CC`     |
+| Key         | Type              | From tag       | Unit    |
+|-------------|-------------------|----------------|---------|
+| `tof_mm`    | int               | `TAG_TOF`      | mm      |
+| `accel_mss` | `[x, y, z]` float | `TAG_IMU_6AXIS`| m/s^2   |
+| `gyro_rads` | `[x, y, z]` float | `TAG_IMU_6AXIS`| rad/s   |
+
+`accel_mss` and `gyro_rads` always appear together (one `0x02` record carries
+both). When encoding, if only one is supplied the other is packed as zeros.
 
 ---
 
@@ -111,7 +126,6 @@ These key names are used everywhere downstream — on the event bus, in the
 |-----------|--------|------------------------------------------------------|
 | `node_id` | int    | from header                                          |
 | `seq_num` | int    | from header                                          |
-| `version` | int    | from header                                          |
 | `crc_ok`  | bool   | computed CRC == received CRC                         |
 | `raw`     | bytes  | the exact candidate frame bytes (for `raw_frames`)   |
 | `values`  | dict   | decoded keys above; **empty `{}` when `crc_ok` is False** |
@@ -122,8 +136,32 @@ length mismatch). A CRC failure is **not** an exception — it returns a
 
 ---
 
-## 5. Change log
+## 5. Reference implementations
 
-| Version | Date       | Change            |
-|---------|------------|-------------------|
-| `0x01`  | 2026-08-30 | Initial spec.     |
+- Encoder origin: the inline `struct.pack` + `calculate_crc16` in
+  `edge/node_tx.py` (pre-refactor).
+- Decoder origin: `parse_tlv_payload` + the framing loop in
+  `backend/legacy/base_rx.py`.
+- `edge/protocol.py` `__main__` block asserts its output is byte-identical to the
+  original inline construction.
+
+---
+
+## 6. Known limitations / deferred
+
+- **No version field on the wire.** A future revision that needs one must change
+  `SYNC` (e.g. `0xAA56`) or steal a bit elsewhere — a bare added byte is
+  ambiguous against deployed nodes.
+- No per-node timestamp in the frame; ingestion timestamps on receipt.
+- No battery / uptime / temperature telemetry yet.
+- `seq_num` is 16-bit and wraps roughly every 9 hours at 2 Hz; the
+  `(node_id, seq_num)` uniqueness in `readings` assumes re-ingestion windows
+  shorter than one wrap.
+
+---
+
+## 7. Change log
+
+| Doc rev | Date       | Change                                                        |
+|---------|------------|--------------------------------------------------------------|
+| 1       | 2026-08-30 | Initial spec — documents the shipped `0xAA55` frame format.  |

@@ -10,10 +10,11 @@ and hand decoded frames back to the loop to publish onto event_bus.bus.
 
 Responsibilities:
   1. Open the serial port (config: NOVENTIS_SERIAL_PORT, NOVENTIS_SERIAL_BAUD).
-  2. Byte-stream reassembly (see docs/protocol-spec.md "Stream framing"):
-       - scan for SYNC (0x4E 0x56)
-       - read the 7-byte header, take PAYLOAD_LEN
-       - read PAYLOAD_LEN + 2 more bytes
+  2. Byte-stream reassembly (see docs/protocol-spec.md "Stream framing";
+     backend/legacy/base_rx.py has a working reference loop):
+       - scan for SYNC (0xAA 0x55)
+       - read the 6-byte header, take PAYLOAD_LEN (byte at offset 5)
+       - read PAYLOAD_LEN + 2 more bytes (payload + CRC)
        - hand the candidate frame to protocol.parse_frame
   3. Resync on ProtocolError / CRC failure: advance one byte past the bad SYNC.
   4. Publish an event for EVERY candidate frame -- CRC pass AND fail -- because
@@ -39,8 +40,9 @@ from __future__ import annotations
 
 import os
 
-SERIAL_PORT = os.getenv("NOVENTIS_SERIAL_PORT", "COM3")
-SERIAL_BAUD = int(os.getenv("NOVENTIS_SERIAL_BAUD", "115200"))
+# Defaults match the original base station (base_rx.py): COM4 @ 9600 baud.
+SERIAL_PORT = os.getenv("NOVENTIS_SERIAL_PORT", "COM4")
+SERIAL_BAUD = int(os.getenv("NOVENTIS_SERIAL_BAUD", "9600"))
 
 
 async def start() -> None:

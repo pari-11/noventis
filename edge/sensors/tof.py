@@ -1,34 +1,27 @@
 """
-edge/sensors/tof.py -- Time-of-Flight distance sensor driver wrapper.
+edge/sensors/tof.py -- Time-of-Flight distance sensor wrapper.
 
-Responsibility: own the ToF sensor and expose a tiny, board-agnostic read API
-that `node_tx.py` calls. Keep the actual vendor driver behind this wrapper so the
-transmit loop never imports it directly.
+Responsibility: own the ToF sensor and expose a tiny, board-agnostic read API.
+Right now node_tx.py talks to `adafruit_vl53l0x` directly; this wrapper is where
+that should move so the transmit loop stops importing the vendor driver.
 
-Expected API (consumed by node_tx.py):
+Expected API (to be consumed by node_tx.py):
     init() -> None
-    read_mm() -> int          # distance in millimetres; 0xFFFF (65535) = out of range
-    read_status() -> int      # sensor range-status code (0 == valid)
+    read_mm() -> int          # distance in millimetres -> protocol key "tof_mm"
 
-These map to protocol tags TAG_TOF_DIST_MM (0x10) and TAG_TOF_STATUS (0x11).
+Maps to protocol tag TAG_TOF (0x01), a uint16 millimetre value. There is no
+separate status tag in the current wire protocol (see docs/protocol-spec.md).
 
 TODO:
-  - [ ] Pick / confirm the sensor part (e.g. VL53L0X / VL53L1X) and driver lib.
-  - [ ] init(): configure I2C bus, timing budget, continuous vs single-shot.
-  - [ ] read_mm(): clamp / map "out of range" to 0xFFFF per docs/protocol-spec.md.
-  - [ ] Extract this from the production script if the logic already lives there.
+  - [ ] Move the VL53L0X init + `vl53.range` read out of node_tx.py to here.
+  - [ ] init(): I2C bus, measurement_timing_budget (node_tx uses 33000).
+  - [ ] Decide how to represent "no reading" (node_tx currently drops the TLV).
 """
-
-RANGE_INVALID_MM = 0xFFFF
 
 
 def init():
-    raise NotImplementedError("tof.init(): wire up the real ToF driver")
+    raise NotImplementedError("tof.init(): move the VL53L0X setup here from node_tx.py")
 
 
 def read_mm():
-    raise NotImplementedError("tof.read_mm(): return distance in mm (0xFFFF if invalid)")
-
-
-def read_status():
-    raise NotImplementedError("tof.read_status(): return sensor range-status code")
+    raise NotImplementedError("tof.read_mm(): return vl53.range (distance in mm)")

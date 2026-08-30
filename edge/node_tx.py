@@ -1,10 +1,26 @@
+"""
+edge/node_tx.py -- Noventis edge node transmit loop (production script).
+
+Refactor note (project constraint #1): the sensor-read and LoRa-transmit logic
+below is unchanged from the production script. The ONLY change is that the inline
+TLV `struct.pack` calls, the `calculate_crc16` helper, and the header/packet
+assembly have been moved into the shared `protocol` module (edge/protocol.py,
+byte-for-byte identical to backend/ingest/protocol.py). See docs/protocol-spec.md.
+
+Fixed-point scaling (accel * 100, gyro * 1000) now lives in
+`protocol.encode_tlv`; `protocol.build_frame` produces byte-identical frames to
+the previous inline construction (asserted by protocol.py's __main__ self-test).
+"""
+
 import time
-import struct
 import serial
 import board
 import busio
 import adafruit_vl53l0x
 import RPi.GPIO as GPIO
+
+# Shared TLV + CRC-16 codec (was inline in this file).
+from protocol import build_frame
 
 # Optional IMU import
 try:
@@ -30,18 +46,6 @@ def wait_for_radio_idle(timeout=2.0):
             break
         time.sleep(0.005)
 
-# --- CRC-16 CCITT Calculation ---
-def calculate_crc16(data: bytes) -> int:
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= (byte << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
-
 # --- Initialize Peripherals ---
 i2c = busio.I2C(board.SCL, board.SDA)
 
@@ -65,12 +69,12 @@ seq_num = 0
 
 try:
     while True:
-        payload = bytearray()
+        readings = {}
 
         # --- TLV Tag 0x01: ToF Sensor ---
         try:
             distance_mm = vl53.range
-            payload.extend(struct.pack(">BBH", 0x01, 2, distance_mm))
+            readings["tof_mm"] = distance_mm
         except Exception as e:
             distance_mm = None
             print(f"ToF Read Error: {e}")
@@ -80,38 +84,25 @@ try:
             try:
                 accel_x, accel_y, accel_z = imu.acceleration  # m/s^2
                 gyro_x, gyro_y, gyro_z = imu.gyro  # rad/s
-
-                # Scale to fixed-point int16
-                ax_i = int(accel_x * 100)
-                ay_i = int(accel_y * 100)
-                az_i = int(accel_z * 100)
-                gx_i = int(gyro_x * 1000)
-                gy_i = int(gyro_y * 1000)
-                gz_i = int(gyro_z * 1000)
-
-                payload.extend(struct.pack(">BBhhhhhh", 0x02, 12, ax_i, ay_i, az_i, gx_i, gy_i, gz_i))
+                readings["accel_mss"] = (accel_x, accel_y, accel_z)
+                readings["gyro_rads"] = (gyro_x, gyro_y, gyro_z)
             except Exception as e:
                 print(f"IMU Read Error: {e}")
 
-        # --- Frame Header Construction ---
-        # Sync(0xAA55), Node_ID(1B), Seq(2B), Payload_Len(1B)
-        header = struct.pack(">HBHB", 0xAA55, NODE_ID, seq_num, len(payload))
-
-        # --- CRC-16 & Packet Assembly ---
-        raw_frame = header + bytes(payload)
-        crc16 = calculate_crc16(raw_frame)
-        packet = raw_frame + struct.pack(">H", crc16)
+        # --- Frame encode: TLV + header + CRC-16 (shared protocol module) ---
+        packet = build_frame(NODE_ID, seq_num, readings)
+        crc_val = int.from_bytes(packet[-2:], "big")
 
         # --- Radio Transmission ---
         wait_for_radio_idle()
         ser.write(packet)
         ser.flush()
 
-        log_str = f"TX Seq #{seq_num:05d} | Frame Len: {len(packet):02d}B | CRC: 0x{crc16:04X}"
+        log_str = f"TX Seq #{seq_num:05d} | Frame Len: {len(packet):02d}B | CRC: 0x{crc_val:04X}"
         if distance_mm is not None:
             log_str += f" | ToF: {distance_mm:4d} mm"
         if imu is not None:
-            log_str += f" | Accel-Z: {accel_z:5.2f} m/s\u00b2"
+            log_str += f" | Accel-Z: {accel_z:5.2f} m/s²"
         print(log_str)
 
         seq_num = (seq_num + 1) & 0xFFFF

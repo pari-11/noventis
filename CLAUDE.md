@@ -13,26 +13,31 @@ Most backend and frontend files are intentionally **stubs** -- module docstring 
 TODO list, no implementation. Do not treat missing logic as a bug.
 
 **Implemented** (small, fully specified, central -- keep them working):
-- `edge/protocol.py` and `backend/ingest/protocol.py` (identical mirror)
+- `edge/protocol.py` and `backend/ingest/protocol.py` (identical mirror);
+  documents/implements the shipped `0xAA55` frame format
+- `edge/node_tx.py` -- the real production TX script, refactored to import
+  `protocol` instead of inlining TLV/CRC (sensor + LoRa logic untouched)
+- `backend/legacy/base_rx.py` -- the original standalone receiver, kept as the
+  decoder reference (not wired into the FastAPI app)
 - `backend/db/models.py`, `backend/db/session.py`
 - `backend/ingest/event_bus.py`
 
-**Stubbed** (fill in when asked): `edge/node_tx.py`, `edge/sensors/*`,
-`backend/main.py`, `backend/ingest/serial_reader.py`, `backend/db/writer.py`,
+**Stubbed** (fill in when asked): `edge/sensors/*`, `backend/main.py`,
+`backend/ingest/serial_reader.py`, `backend/db/writer.py`,
 `backend/ws/manager.py`, `backend/api/*`, all of `frontend/src/*`.
 
 ## Non-negotiable constraints (do not re-litigate without asking)
 
-1. **`edge/node_tx.py` is production code.** The user pastes in their existing,
-   already-working script. Do **not** rewrite its sensor-read or LoRa-transmit
-   logic. The only permitted refactor: pull inline TLV encoding + CRC-16 out into
-   `edge/protocol.py` and import it.
+1. **`edge/node_tx.py` is production code.** Do **not** rewrite its sensor-read
+   or LoRa-transmit logic. The TLV encoding + CRC-16 have already been pulled out
+   into `edge/protocol.py` and are imported; keep it that way.
 
 2. **Two protocol modules, one spec.** `edge/protocol.py` and
    `backend/ingest/protocol.py` must stay **byte-for-byte identical** (tag values,
-   byte layout, CRC parameters). `docs/protocol-spec.md` is the source of truth.
-   Change the spec and both modules together, in one commit. This is the
-   project's single point of failure.
+   byte layout, CRC parameters, scale factors). `docs/protocol-spec.md` is the
+   source of truth and describes the format the deployed firmware already speaks
+   (`0xAA55` sync, tag `0x01` ToF / `0x02` IMU 6-axis). Change the spec and both
+   modules together, in one commit. This is the project's single point of failure.
 
 3. **Serial I/O must never block the FastAPI event loop.**
    `backend/ingest/serial_reader.py` runs the pyserial loop in a background
