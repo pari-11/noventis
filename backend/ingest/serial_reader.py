@@ -153,6 +153,7 @@ class SerialReader:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._port: str | None = None          # open device path, or None when disconnected
+        self._bytes_read = 0
         self._frames_ok = 0
         self._frames_bad = 0
         self._last_error: str | None = None
@@ -183,6 +184,7 @@ class SerialReader:
             "connected": self.connected,
             "port": self._port,
             "baud": self._baud,
+            "bytes_read": self._bytes_read,
             "frames_ok": self._frames_ok,
             "frames_bad": self._frames_bad,
             "last_error": self._last_error,
@@ -228,11 +230,23 @@ class SerialReader:
             log.info("LoRa base station connected on %s", device)
 
             buf = bytearray()
+            idle_ticks = 0
             while not self._stop.is_set():
                 waiting = ser.in_waiting
                 chunk = ser.read(waiting or 1)  # returns within READ_TIMEOUT_S when idle
                 if not chunk:
+                    idle_ticks += 1
+                    if idle_ticks % 25 == 0:  # ~5 s of total silence
+                        log.warning(
+                            "%s: no bytes received in ~5s (base station wired for Mode 0 / "
+                            "node transmitting?) -- %d bytes seen so far",
+                            device, self._bytes_read,
+                        )
                     continue
+                idle_ticks = 0
+                self._bytes_read += len(chunk)
+                log.debug("%s: +%d bytes (%d total): %s",
+                          device, len(chunk), self._bytes_read, chunk.hex())
                 buf.extend(chunk)
                 for frame in extract_frames(buf):
                     self._handle_frame(frame)

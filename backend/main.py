@@ -118,6 +118,7 @@ async def health() -> dict:
             "connected": rstat["connected"],
             "port": rstat["port"],
             "baud": rstat["baud"],
+            "bytes_read": rstat["bytes_read"],
             "frames_ok": rstat["frames_ok"],
             "frames_bad": rstat["frames_bad"],
             "last_error": rstat["last_error"],

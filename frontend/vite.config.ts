@@ -1,22 +1,24 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// Dev server proxies the REST + WebSocket API to the FastAPI backend on :8000,
-// so the frontend can use same-origin relative paths ("/nodes", "/live", ...).
-//
-// TODO:
-//  - [ ] Confirm backend port / host; make it configurable via env if needed.
-//  - [ ] Add a build `base` if the app is served under a sub-path.
+// The FastAPI backend (uvicorn) listens on IPv4 127.0.0.1:8000 by default.
+// Use the numeric address, not "localhost": on modern Node/Windows "localhost"
+// resolves to IPv6 ::1 first, and uvicorn is not listening there -> the proxy
+// fails with `connect ECONNREFUSED ::1:8000`.
+// Override with:  VITE_BACKEND=http://<host>:<port> npm run dev
+const BACKEND = process.env.VITE_BACKEND ?? 'http://127.0.0.1:8000'
+const WS_BACKEND = BACKEND.replace(/^http/, 'ws')
+
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
     proxy: {
-      '/health': 'http://localhost:8000',
-      '/nodes': 'http://localhost:8000',
-      '/readings': 'http://localhost:8000',
-      '/raw-frames': 'http://localhost:8000',
-      '/live': { target: 'ws://localhost:8000', ws: true },
+      '/health': BACKEND,
+      '/nodes': BACKEND,
+      '/readings': BACKEND,
+      '/raw-frames': BACKEND,
+      '/live': { target: WS_BACKEND, ws: true },
     },
   },
 })
