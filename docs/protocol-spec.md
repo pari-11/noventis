@@ -110,14 +110,25 @@ production firmware exactly. Each scaled axis must fit in `int16`
 These key names are used everywhere downstream — on the event bus, in the
 `readings` table, and in WebSocket JSON messages:
 
-| Key         | Type              | From tag       | Unit    |
-|-------------|-------------------|----------------|---------|
-| `tof_mm`    | int               | `TAG_TOF`      | mm      |
-| `accel_mss` | `[x, y, z]` float | `TAG_IMU_6AXIS`| m/s^2   |
-| `gyro_rads` | `[x, y, z]` float | `TAG_IMU_6AXIS`| rad/s   |
+| Key                | Type              | From tag       | Unit    |
+|--------------------|-------------------|----------------|---------|
+| `tof_mm`           | int               | `TAG_TOF`      | mm      |
+| `tof_out_of_range` | bool              | `TAG_TOF`      | —       |
+| `accel_mss`        | `[x, y, z]` float | `TAG_IMU_6AXIS`| m/s^2   |
+| `gyro_rads`        | `[x, y, z]` float | `TAG_IMU_6AXIS`| rad/s   |
 
 `accel_mss` and `gyro_rads` always appear together (one `0x02` record carries
 both). When encoding, if only one is supplied the other is packed as zeros.
+
+`tof_out_of_range` is **not produced by the codec** and is **not on the wire** —
+`decode_tlv` returns only the raw `tof_mm`. It is derived one hop downstream, in
+`backend/ingest/serial_reader.py`, and added to `values` alongside the untouched
+`tof_mm` whenever a ToF reading is present: `tof_mm > TOF_MAX_VALID_MM` (default
+2000 mm, env `NOVENTIS_TOF_MAX_VALID_MM`). The VL53L0X emits a fixed ~8190–8191 mm
+sentinel when it has no valid target; this flag lets consumers tell that apart
+from a real distance without changing the frame format or the two `protocol.py`
+modules. It rides through to the event bus, the `readings.tof_out_of_range`
+column, and `/live` / `/readings` JSON.
 
 ---
 
@@ -166,7 +177,13 @@ output is byte-identical to the original inline construction.
 - No battery / uptime / temperature telemetry yet.
 - `seq_num` is 16-bit and wraps roughly every 9 hours at 2 Hz; the
   `(node_id, seq_num)` uniqueness in `readings` assumes re-ingestion windows
-  shorter than one wrap.
+  shorter than one wrap. A **node reboot** resets `seq_num` to ~0 mid-wrap, which
+  would collide with the just-stored session and be dropped by the `ON CONFLICT
+  DO NOTHING` guard. `backend/db/writer.py` mitigates this: a large backward
+  `seq_num` jump (distinguished from the `0xFFFF -> 0x0000` wrap) after a gap of
+  silence is treated as a restart and clears that node's prior `readings`
+  (`raw_frames` is kept). A future wire revision could instead carry a boot/epoch
+  counter -- see the version-field note above.
 
 ---
 
@@ -175,3 +192,4 @@ output is byte-identical to the original inline construction.
 | Doc rev | Date       | Change                                                        |
 |---------|------------|--------------------------------------------------------------|
 | 1       | 2026-08-30 | Initial spec — documents the shipped `0xAA55` frame format.  |
+| 2       | 2026-08-31 | §3: document the derived `tof_out_of_range` key (backend-side, not on the wire; codec and both `protocol.py` modules unchanged). |

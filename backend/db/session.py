@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 
-from sqlalchemy import event
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -51,10 +51,29 @@ engine: AsyncEngine = make_engine()
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+def _retrofit_columns(conn) -> None:
+    """Add columns that ``create_all`` cannot add to an already-existing table.
+
+    No Alembic yet (constraint #6). This is a tiny, idempotent stopgap: it only
+    ever ADDs a nullable column and back-fills it from data already in the row,
+    so it is safe to run on every startup and never touches existing values
+    beyond the one new column.
+    """
+    cols = {c["name"] for c in inspect(conn).get_columns("readings")}
+    if "tof_out_of_range" not in cols:
+        conn.execute(text("ALTER TABLE readings ADD COLUMN tof_out_of_range BOOLEAN"))
+        # Back-fill history so old sentinel rows (~8190 mm) are flagged too.
+        conn.execute(text(
+            "UPDATE readings SET tof_out_of_range = (tof_mm > 2000) "
+            "WHERE tof_mm IS NOT NULL"
+        ))
+
+
 async def init_db(target: AsyncEngine | None = None) -> None:
     """Create tables if they do not exist. Called from main.py's lifespan."""
     async with (target or engine).begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_retrofit_columns)
 
 
 async def dispose() -> None:

@@ -9,7 +9,15 @@ Per event (see serial_reader.SerialReader._handle_frame for the shape):
   2. UPSERT nodes.last_seen = received_at      -- for every frame that carries a node_id
   3. INSERT into readings                      -- ONLY when crc_ok, and
      ON CONFLICT (node_id, seq_num) DO NOTHING -- so replaying a capture / restarting
-                                                  the reader is idempotent
+                                                  the reader is idempotent WITHIN a
+                                                  session
+
+Node restart handling: seq_num is per-node and resets to ~0 when a node reboots,
+so the fresh session would collide with the previous session's rows and be
+silently dropped by the ON CONFLICT guard (readings would freeze; see
+protocol-spec.md section 6). When a clear backward jump in seq_num after a gap of
+silence marks a restart, this writer drops that node's prior `readings` so the
+new session ingests. `raw_frames` (the forensic log) is never touched.
 
 One transaction per event (the node rate is ~2 Hz -- batching is a later concern).
 A failure on one event is logged and skipped; it never kills the loop.
@@ -23,7 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .models import Node, RawFrame, Reading
@@ -32,6 +42,30 @@ from .session import SessionLocal
 log = logging.getLogger(__name__)
 
 _NONE3 = (None, None, None)
+
+# -- node-restart (seq reset) detection -------------------------------------- #
+SEQ_SPACE = 0x10000            # seq_num is uint16
+# A backward move in seq_num of at least this much is not reorder jitter...
+RESTART_BACKSTEP_MIN = 256
+# ...and one within this much of a full wrap IS the legitimate 0xFFFF->0x0000
+# rollover, not a restart (a restart lands near 0 from an arbitrary seq_num,
+# whereas a wrap starts from near the top of the space).
+RESTART_WRAP_BAND = SEQ_SPACE - RESTART_BACKSTEP_MIN
+# ...and the node must have gone quiet first (a reboot, not a reordered burst).
+RESTART_SILENCE_S = 2.0
+
+
+def _looks_like_restart(
+    prev_seq: int | None, prev_ts: datetime | None, seq: int, now: datetime
+) -> bool:
+    if prev_seq is None:
+        return False
+    backstep = prev_seq - seq
+    if backstep < RESTART_BACKSTEP_MIN or backstep > RESTART_WRAP_BAND:
+        return False
+    if prev_ts is not None and (now - prev_ts).total_seconds() < RESTART_SILENCE_S:
+        return False
+    return True
 
 
 class DBWriter:
@@ -42,7 +76,11 @@ class DBWriter:
         self._raw_written = 0
         self._readings_written = 0
         self._readings_duplicate = 0
+        self._sessions_reset = 0
         self._errors = 0
+        # per-node: last seq_num and receipt time of a reading-bearing frame
+        self._last_seq: dict[int, int] = {}
+        self._last_seen_ts: dict[int, datetime] = {}
 
     # -- lifecycle ------------------------------------------------------- #
     def start(self) -> None:
@@ -65,6 +103,7 @@ class DBWriter:
             "raw_written": self._raw_written,
             "readings_written": self._readings_written,
             "readings_duplicate": self._readings_duplicate,
+            "sessions_reset": self._sessions_reset,
             "errors": self._errors,
         }
 
@@ -84,6 +123,7 @@ class DBWriter:
     async def _persist(self, event: dict) -> None:
         node_id = event["node_id"]
         received_at = event["received_at"]
+        seq = event["seq_num"]
 
         async with self._session_factory() as session:
             async with session.begin():
@@ -113,15 +153,40 @@ class DBWriter:
                 store_reading = event["crc_ok"] and node_id is not None and bool(values)
                 inserted_reading = False
                 if store_reading:
+                    prev_seq = self._last_seq.get(node_id)
+                    prev_ts = self._last_seen_ts.get(node_id)
+                    if prev_seq is None:
+                        # first reading-bearing frame for this node since the
+                        # writer started -- seed from disk so a restart that
+                        # happened while the backend was down is still caught.
+                        seeded = (await session.execute(
+                            select(func.max(Reading.seq_num), func.max(Reading.timestamp))
+                            .where(Reading.node_id == node_id)
+                        )).one()
+                        prev_seq, prev_ts = seeded[0], seeded[1]
+
+                    if _looks_like_restart(prev_seq, prev_ts, seq, received_at):
+                        await session.execute(
+                            delete(Reading).where(Reading.node_id == node_id)
+                        )
+                        self._sessions_reset += 1
+                        log.warning(
+                            "node %s seq restarted (last %s -> now %s); cleared its "
+                            "prior readings so the new session ingests -- raw_frames "
+                            "is untouched",
+                            node_id, prev_seq, seq,
+                        )
+
                     ax, ay, az = values.get("accel_mss") or _NONE3
                     gx, gy, gz = values.get("gyro_rads") or _NONE3
                     result = await session.execute(
                         sqlite_insert(Reading)
                         .values(
                             node_id=node_id,
-                            seq_num=event["seq_num"],
+                            seq_num=seq,
                             timestamp=received_at,
                             tof_mm=values.get("tof_mm"),
+                            tof_out_of_range=values.get("tof_out_of_range"),
                             accel_x=ax, accel_y=ay, accel_z=az,
                             gyro_x=gx, gyro_y=gy, gyro_z=gz,
                         )
@@ -129,9 +194,11 @@ class DBWriter:
                     )
                     inserted_reading = bool(result.rowcount)
 
-        # counters updated after the transaction commits cleanly
+        # state + counters updated after the transaction commits cleanly
         self._raw_written += 1
         if store_reading:
+            self._last_seq[node_id] = seq
+            self._last_seen_ts[node_id] = received_at
             if inserted_reading:
                 self._readings_written += 1
             else:

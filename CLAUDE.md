@@ -67,7 +67,15 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
    - `raw_frames`: every packet received, `crc_ok` pass/fail, nullable `node_id`
      -- a forensic log.
    - `readings`: CRC-valid decoded values only; index `(node_id, timestamp)`;
-     **unique `(node_id, seq_num)`** for idempotent re-ingestion.
+     **unique `(node_id, seq_num)`** for idempotent re-ingestion *within a
+     session*. A node reboot resets `seq_num` to ~0 and would collide with the
+     prior session (readings freeze); `db/writer.py` detects the backward-jump +
+     silence and clears that node's prior `readings` so the new session ingests
+     (`raw_frames` untouched; `status().sessions_reset` counts it).
+     Includes a derived `tof_out_of_range` bool (raw `tof_mm` above
+     `TOF_MAX_VALID_MM`, the VL53L0X no-target sentinel) computed in
+     `ingest/serial_reader.py` -- **not** in the codec, so the two `protocol.py`
+     modules stay identical (see #2).
 
 6. **Persistence:** SQLAlchemy **async** ORM against **SQLite in WAL mode**. No
    Alembic yet -- `Base.metadata.create_all` is fine at this stage.

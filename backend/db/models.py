@@ -111,7 +111,11 @@ class Reading(Base):
     # Decoded TLV values -- see docs/protocol-spec.md section 3.
     # Flat float columns (not JSON) to mirror base_rx.py's proven schema and keep
     # per-axis filtering/aggregation cheap in SQLite.
-    tof_mm: Mapped[int | None] = mapped_column(Integer)          # tag 0x01, millimetres
+    tof_mm: Mapped[int | None] = mapped_column(Integer)          # tag 0x01, millimetres (raw, verbatim)
+    # True when tof_mm is the VL53L0X no-target sentinel (> TOF_MAX_VALID_MM),
+    # i.e. not a real distance. Derived in ingest/serial_reader.py; NULL for
+    # rows with no ToF reading. See docs/protocol-spec.md section 3.
+    tof_out_of_range: Mapped[bool | None] = mapped_column(Boolean)
     accel_x: Mapped[float | None] = mapped_column(Float)         # tag 0x02, m/s^2
     accel_y: Mapped[float | None] = mapped_column(Float)
     accel_z: Mapped[float | None] = mapped_column(Float)

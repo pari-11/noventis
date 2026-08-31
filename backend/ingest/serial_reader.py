@@ -34,7 +34,11 @@ Published event shape (see also ingest/event_bus.py)::
       "crc_ok":      bool,
       "raw":         bytes,        # exact candidate-frame bytes
       "raw_hex":     str,          # raw.hex(), convenience for JSON / logs
-      "values":      dict,         # decoded TLV keys; {} when crc_ok is False
+      "values":      dict,         # decoded TLV keys; {} when crc_ok is False.
+                                   #   When a tof_mm key is present it is carried
+                                   #   verbatim and a derived bool
+                                   #   "tof_out_of_range" is added (see
+                                   #   TOF_MAX_VALID_MM below).
       "received_at": datetime,     # timezone-aware UTC, stamped on receipt
     }
 """
@@ -64,6 +68,21 @@ DEFAULT_BAUD = int(os.getenv("NOVENTIS_SERIAL_BAUD", "9600"))  # E22 UART is 960
 RESCAN_INTERVAL_S = 3.0
 READ_TIMEOUT_S = 0.2
 READ_CHUNK = 4096
+
+# VL53L0X out-of-range sentinel ------------------------------------------------ #
+# The VL53L0X reports a large fixed value (~0x1FFE / 0x1FFF mm, i.e. ~8.19 m)
+# when it has no valid target. Confirmed against the forensic log: genuine
+# readings top out below 1 m while no-target frames land dead on 8190/8191 mm,
+# with nothing in between. A ToF value above this threshold is a "no target"
+# marker, not a distance, so we flag it instead of letting it distort the
+# dashboard chart's autoscale.
+#
+# This lives here -- in the ingest fan-out, downstream of the codec -- and NOT
+# in protocol.decode_tlv: edge/protocol.py and backend/ingest/protocol.py must
+# stay byte-for-byte identical (constraint #2), and this is an interpretation of
+# the value, not a wire-format change. The raw value is still carried verbatim,
+# in raw_frames and in the reading's tof_mm column, alongside the derived flag.
+TOF_MAX_VALID_MM = int(os.getenv("NOVENTIS_TOF_MAX_VALID_MM", "2000"))
 
 
 class NoAdapterFound(Exception):
@@ -272,6 +291,12 @@ class SerialReader:
             self._frames_ok += 1
         else:
             self._frames_bad += 1
+
+        # Annotate (not rewrite) the ToF reading: keep the raw value, add a flag
+        # so downstream consumers can tell a real distance from the VL53L0X
+        # no-target sentinel. See TOF_MAX_VALID_MM.
+        if crc_ok and values.get("tof_mm") is not None:
+            values["tof_out_of_range"] = values["tof_mm"] > TOF_MAX_VALID_MM
 
         self._publish({
             "node_id": node_id,

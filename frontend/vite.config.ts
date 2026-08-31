@@ -15,6 +15,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/health': BACKEND,
+      '/session': BACKEND,
       '/nodes': BACKEND,
       '/readings': BACKEND,
       '/raw-frames': BACKEND,

@@ -51,7 +51,11 @@ serial bytes  (0xAA55-framed; see protocol-spec.md)
 
 `values` holds the decoded keys `tof_mm`, `accel_mss`, `gyro_rads`
 (see protocol-spec.md §3); `db.writer` flattens the vectors into the
-`accel_{x,y,z}` / `gyro_{x,y,z}` columns.
+`accel_{x,y,z}` / `gyro_{x,y,z}` columns. `ingest/serial_reader.py` also adds a
+derived `tof_out_of_range` bool (raw `tof_mm` above `TOF_MAX_VALID_MM`, the
+VL53L0X no-target sentinel) — carried on the bus and stored in
+`readings.tof_out_of_range`. The wire format and both `protocol.py` modules are
+unchanged.
 
 `db.writer` and `ws.manager` subscribe **independently**. Neither imports
 pyserial or touches the port. If one is slow or crashes, the other is unaffected.
@@ -62,11 +66,18 @@ pyserial or touches the port. If one is slow or crashes, the other is unaffected
 |--------------|--------------------------------|--------------------------------------------------------------|-------------|
 | `nodes`      | known nodes                    | `node_id` PK, `last_seen`                                     | `status` computed on read, never stored |
 | `raw_frames` | forensic log of every packet   | `id` PK, `node_id` (nullable), `received_at`, `crc_ok`, `raw` | index on `received_at`, `node_id` |
-| `readings`   | CRC-valid decoded values only  | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
+| `readings`   | CRC-valid decoded values only  | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `tof_out_of_range` (derived), `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
 
 The unique `(node_id, seq_num)` constraint makes re-ingestion (replaying a serial
-capture, restarting the reader) idempotent -- duplicate readings are dropped with
-`ON CONFLICT DO NOTHING`.
+capture, restarting the reader) idempotent *within a session* -- duplicate
+readings are dropped with `ON CONFLICT DO NOTHING`.
+
+A **node reboot** resets its `seq_num` to ~0, which would otherwise collide with
+the prior session and freeze that node's readings. `db/writer.py` watches each
+node's `seq_num`: a large backward jump (not the `0xFFFF -> 0x0000` wrap) after a
+gap of silence is a restart, and it clears that node's `readings` so the new
+session ingests. `raw_frames` keeps everything; `writer.status().sessions_reset`
+counts how often it has fired.
 
 Node `status` is derived: `online` if `now - last_seen <= NODE_TIMEOUT`
 (env-configured, default ~30 s), else `offline`.
@@ -90,7 +101,9 @@ See [protocol-spec.md](protocol-spec.md) -- the source of truth for both
 
 ## Deferred
 
-- Alembic migrations (`init_db()` runs `create_all` on startup for now).
+- Alembic migrations (`init_db()` runs `create_all` on startup, plus a tiny
+  idempotent `_retrofit_columns` shim for ADD-COLUMN-only changes `create_all`
+  can't apply to an existing table).
 - Auth on the API / WebSocket.
 - Multi-process or multi-host fan-out (event bus is in-process only).
 - Downsampling / retention for `raw_frames`.

@@ -35,6 +35,17 @@ BAUD_RATE = 9600
 AUX_PIN = 25
 NODE_ID = 0x01
 
+# VL53L0X measurement timing budget (microseconds). This does NOT change how
+# often readings are taken -- that is the transmit loop's time.sleep(0.5) below
+# (~2 Hz). The timing budget only controls how much internal averaging the
+# sensor does per single reading before returning a value: a longer budget means
+# less noise per reading. At 100 ms the sensor still finishes well within the
+# 500 ms loop interval (no contention), so this is a pure precision improvement
+# -- no reduction in reading frequency and no filtering of the data itself.
+# Every reading the sensor produces is still transmitted and stored as-is, so
+# the frontend's "Raw" mode still reflects genuine, unfiltered sensor output.
+TOF_TIMING_BUDGET_US = 100000  # 100 ms (was 33 ms)
+
 # --- Setup GPIO & Radio Status ---
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(AUX_PIN, GPIO.IN)
@@ -53,7 +64,7 @@ i2c = busio.I2C(board.SCL, board.SDA)
 #    a wedged / unwired VL53L0X must not stop the node transmitting).
 try:
     vl53 = adafruit_vl53l0x.VL53L0X(i2c)
-    vl53.measurement_timing_budget = 33000
+    vl53.measurement_timing_budget = TOF_TIMING_BUDGET_US
     print("[INIT] VL53L0X ToF detected at 0x29.")
 except Exception as e:
     vl53 = None

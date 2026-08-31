@@ -20,6 +20,7 @@ export type LiveMessage = {
   ts: string
   values: {
     tof_mm?: number
+    tof_out_of_range?: boolean
     accel_mss?: [number, number, number]
     gyro_rads?: [number, number, number]
   }

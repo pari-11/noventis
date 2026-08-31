@@ -17,6 +17,7 @@ Shutdown tears them down in reverse and disposes the DB engine.
 
 Routes:
   GET  /health                     -- LoRa port connected? how many nodes seen?
+  GET  /session                    -- when this backend run started (SESSION_START_TS)
   GET  /nodes                      -- api/nodes.py
   GET  /readings?node_id=...       -- api/readings.py
   GET  /raw-frames?node_id=...     -- api/raw_frames.py
@@ -32,6 +33,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +56,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 log = logging.getLogger("noventis")
+
+# When this backend process started. Set once, at import/startup; a restart
+# resets it -- intentional, no persistence. The frontend reads this via
+# GET /session and passes it as `since=` to bound "current session" views.
+SESSION_START_TS = datetime.now(timezone.utc)
 
 CORS_ORIGINS = [
     o.strip()
@@ -114,6 +121,7 @@ async def health() -> dict:
         nodes_seen = (await session.execute(select(func.count()).select_from(Node))).scalar_one()
     return {
         "status": "ok",
+        "session_start": SESSION_START_TS.isoformat(),
         "lora": {
             "connected": rstat["connected"],
             "port": rstat["port"],
@@ -128,6 +136,12 @@ async def health() -> dict:
         "ws": app.state.ws_manager.status(),
         "bus": bus.status(),
     }
+
+
+@app.get("/session", tags=["meta"])
+async def session_info() -> dict:
+    """When the current backend run began. Resets on restart (no persistence)."""
+    return {"session_start": SESSION_START_TS.isoformat()}
 
 
 @app.websocket("/live")

@@ -4,12 +4,16 @@
  * Owns the selected node_id (null = all) and passes it to NodeSelector,
  * LiveChart and HistoryPanel. Polls GET /health every 5s and shows whether the
  * backend's LoRa serial port is currently connected.
+ *
+ * node = "all"  -> full-width grid of NodeSummaryCards (no chart, no history).
+ * node selected -> LiveChart + HistoryPanel side by side.
  */
 
 import { useEffect, useState } from 'react'
-import { NodeSelector } from './components/NodeSelector'
+import { NodeSelector, type NodeInfo } from './components/NodeSelector'
 import { LiveChart } from './components/LiveChart'
 import { HistoryPanel } from './components/HistoryPanel'
+import { NodeSummaryCard } from './components/NodeSummaryCard'
 
 type Health = {
   status: string
@@ -28,6 +32,8 @@ export default function App() {
   const [nodeId, setNodeId] = useState<number | null>(null)
   const [health, setHealth] = useState<Health | null>(null)
   const [healthErr, setHealthErr] = useState<string | null>(null)
+  const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
     let alive = true
@@ -53,6 +59,34 @@ export default function App() {
       window.clearInterval(id)
     }
   }, [])
+
+  // summary grid only shows in the "all nodes" view -- poll /nodes and keep a
+  // 1s clock running only while it is visible.
+  useEffect(() => {
+    if (nodeId != null) return
+    let alive = true
+    const load = () =>
+      fetch('/nodes')
+        .then((r) => (r.ok ? (r.json() as Promise<NodeInfo[]>) : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((d) => {
+          if (alive) setNodes(d)
+        })
+        .catch(() => {
+          /* NodeSelector surfaces /nodes errors; the grid just waits */
+        })
+    load()
+    const id = window.setInterval(load, 5000)
+    return () => {
+      alive = false
+      window.clearInterval(id)
+    }
+  }, [nodeId])
+
+  useEffect(() => {
+    if (nodeId != null) return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [nodeId])
 
   const lora = health?.lora
 
@@ -84,10 +118,30 @@ export default function App() {
 
       <NodeSelector value={nodeId} onChange={setNodeId} />
 
-      <main className="grid">
-        <LiveChart nodeId={nodeId} />
-        <HistoryPanel nodeId={nodeId} />
-      </main>
+      {nodeId == null ? (
+        <main>
+          <section className="card">
+            <header className="card-head">
+              <h2>All nodes</h2>
+              <span className="muted small">{nodes.length} node(s)</span>
+            </header>
+            {nodes.length === 0 ? (
+              <p className="muted small">no nodes seen yet</p>
+            ) : (
+              <div className="summary-grid">
+                {nodes.map((n) => (
+                  <NodeSummaryCard key={n.node_id} node={n} now={now} onSelect={setNodeId} />
+                ))}
+              </div>
+            )}
+          </section>
+        </main>
+      ) : (
+        <main className="grid">
+          <LiveChart key={nodeId} nodeId={nodeId} />
+          <HistoryPanel nodeId={nodeId} />
+        </main>
+      )}
     </div>
   )
 }

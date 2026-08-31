@@ -32,6 +32,7 @@ class ReadingOut(BaseModel):
     seq_num: int
     timestamp: datetime
     tof_mm: int | None
+    tof_out_of_range: bool | None = None
     accel_x: float | None
     accel_y: float | None
     accel_z: float | None
