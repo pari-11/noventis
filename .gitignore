@@ -21,3 +21,9 @@ dist/
 
 # Handover PDF is added out of band
 docs/handover/*.pdf
+
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
