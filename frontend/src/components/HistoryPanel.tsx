@@ -12,6 +12,10 @@
  * resets it). The readings fetch also runs on node change, the manual Refresh
  * button, and a 25s auto-refresh interval; auto-refresh polls /readings ONLY,
  * never /session. Older sessions' rows stay in the DB, just outside this filter.
+ *
+ * Sensor filter (All / ToF / |accel| / |gyro|): a client-side view control that
+ * shows/hides the corresponding table columns. The CSV export honours it --
+ * only the currently-visible columns are serialised.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -33,15 +37,45 @@ export type Reading = {
   gyro_z: number | null
 }
 
-type Props = { nodeId: number | null }
+type Props = { nodeId: number | null; nodeName?: string }
+
+type SensorFilter = 'all' | 'tof' | 'accel' | 'gyro'
+
+const FILTERS: { key: SensorFilter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'tof', label: 'ToF' },
+  { key: 'accel', label: '|accel|' },
+  { key: 'gyro', label: '|gyro|' },
+]
 
 const fmt = (v: number | null, d = 2) => (v == null ? '·' : v.toFixed(d))
 
-export function HistoryPanel({ nodeId }: Props) {
+const Icon = ({ d, size = 14 }: { d: string; size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d={d} />
+  </svg>
+)
+const I = {
+  refresh: 'M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6',
+  download: 'M12 3v12m0 0 4-4m-4 4-4-4M4 20h16',
+}
+
+export function HistoryPanel({ nodeId, nodeName }: Props) {
   const [rows, setRows] = useState<Reading[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [pulsing, setPulsing] = useState(false)
+  const [filter, setFilter] = useState<SensorFilter>('all')
   // start of the backend's current run. Fetched fresh on every mount, never
   // stored -- until it resolves, the readings fetch holds off.
   const [sessionStart, setSessionStart] = useState<string | null>(null)
@@ -52,6 +86,10 @@ export function HistoryPanel({ nodeId }: Props) {
   // always clears for the request that is actually current.
   const gen = useRef(0)
   const pulseTimer = useRef<number | undefined>(undefined)
+
+  const showTof = filter === 'all' || filter === 'tof'
+  const showAccel = filter === 'all' || filter === 'accel'
+  const showGyro = filter === 'all' || filter === 'gyro'
 
   // (1) once per mount: the backend's current session_start. Not re-fetched by
   // auto-refresh -- it can't change while the backend run is alive.
@@ -113,10 +151,38 @@ export function HistoryPanel({ nodeId }: Props) {
 
   useEffect(() => () => window.clearTimeout(pulseTimer.current), [])
 
+  // CSV of the currently-loaded rows, honouring the active sensor filter:
+  // only the visible columns are serialised.
+  const exportCsv = useCallback(() => {
+    if (rows.length === 0) return
+    const head = ['time', 'seq']
+    if (showTof) head.push('tof_mm', 'tof_out_of_range')
+    if (showAccel) head.push('accel_x', 'accel_y', 'accel_z')
+    if (showGyro) head.push('gyro_x', 'gyro_y', 'gyro_z')
+    const cell = (v: number | null) => (v == null ? '' : String(v))
+    const body = rows.map((r) => {
+      const c: string[] = [new Date(r.timestamp).toISOString(), String(r.seq_num)]
+      if (showTof) c.push(cell(r.tof_mm), r.tof_out_of_range ? 'true' : 'false')
+      if (showAccel) c.push(cell(r.accel_x), cell(r.accel_y), cell(r.accel_z))
+      if (showGyro) c.push(cell(r.gyro_x), cell(r.gyro_y), cell(r.gyro_z))
+      return c.join(',')
+    })
+    const url = URL.createObjectURL(
+      new Blob([[head.join(','), ...body].join('\n')], { type: 'text/csv' }),
+    )
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `noventis-node-${nodeId}-session.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [rows, nodeId, showTof, showAccel, showGyro])
+
   return (
     <section className="card history">
       <header className="card-head">
-        <h2>Current session history {nodeId == null ? '· all nodes' : `· node ${nodeId}`}</h2>
+        <h2>
+          Current session history · {nodeId == null ? 'all nodes' : (nodeName ?? `Node ${nodeId}`)}
+        </h2>
         <div className="history-actions">
           {nodeId != null && (
             <span
@@ -126,15 +192,33 @@ export function HistoryPanel({ nodeId }: Props) {
               <span className="dot" /> auto
             </span>
           )}
-          <button
-            className="chip"
-            disabled={nodeId == null || loading}
-            onClick={() => void load()}
-          >
+          <button className="btn" disabled={nodeId == null || loading} onClick={() => void load()}>
+            <Icon d={I.refresh} />
             {loading ? 'loading…' : 'Refresh'}
+          </button>
+          <button className="btn" disabled={rows.length === 0} onClick={exportCsv}>
+            <Icon d={I.download} />
+            Export CSV
           </button>
         </div>
       </header>
+
+      {nodeId != null && (
+        <div className="hist-filter">
+          <div className="seg" role="group" aria-label="sensor column filter">
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                className={filter === f.key ? 'on' : ''}
+                aria-pressed={filter === f.key}
+                onClick={() => setFilter(f.key)}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {nodeId == null && <p className="muted small">pick a node to see its history</p>}
       {error && <p className="error small">{error}</p>}
@@ -144,44 +228,50 @@ export function HistoryPanel({ nodeId }: Props) {
 
       {rows.length > 0 && (
         <>
-        <div className="table-wrap history-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>time</th>
-                <th>seq</th>
-                <th>ToF mm</th>
-                <th>accel x/y/z (m/s²)</th>
-                <th>gyro x/y/z (rad/s)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.id}>
-                  <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
-                  <td>{r.seq_num}</td>
-                  <td>
-                    {r.tof_out_of_range ? (
-                      <span className="muted">out of range</span>
-                    ) : (
-                      r.tof_mm ?? '·'
-                    )}
-                  </td>
-                  <td>
-                    {fmt(r.accel_x)} / {fmt(r.accel_y)} / {fmt(r.accel_z)}
-                  </td>
-                  <td>
-                    {fmt(r.gyro_x, 3)} / {fmt(r.gyro_y, 3)} / {fmt(r.gyro_z, 3)}
-                  </td>
+          <div className="table-wrap history-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>time</th>
+                  <th>seq</th>
+                  {showTof && <th>ToF mm</th>}
+                  {showAccel && <th>accel x/y/z (m/s²)</th>}
+                  {showGyro && <th>gyro x/y/z (rad/s)</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="muted small">
-          {rows.length} reading{rows.length === 1 ? '' : 's'} this session
-          {rows.length >= 500 ? ' (newest 500 — scroll for older)' : ' — scroll for older'}
-        </p>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.id}>
+                    <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
+                    <td>{r.seq_num}</td>
+                    {showTof && (
+                      <td>
+                        {r.tof_out_of_range ? (
+                          <span className="muted">out of range</span>
+                        ) : (
+                          (r.tof_mm ?? '·')
+                        )}
+                      </td>
+                    )}
+                    {showAccel && (
+                      <td className="muted">
+                        {fmt(r.accel_x)} / {fmt(r.accel_y)} / {fmt(r.accel_z)}
+                      </td>
+                    )}
+                    {showGyro && (
+                      <td className="muted">
+                        {fmt(r.gyro_x, 3)} / {fmt(r.gyro_y, 3)} / {fmt(r.gyro_z, 3)}
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="muted small">
+            {rows.length} reading{rows.length === 1 ? '' : 's'} this session
+            {rows.length >= 500 ? ' (newest 500 — scroll for older)' : ' — scroll for older'}
+          </p>
         </>
       )}
     </section>

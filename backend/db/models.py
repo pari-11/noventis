@@ -30,6 +30,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    String,
     TypeDecorator,
     UniqueConstraint,
 )
@@ -69,6 +70,21 @@ class Base(DeclarativeBase):
     pass
 
 
+# node_id vs name -- the invariant:
+#   * `node_id` is the fixed, protocol-level identifier. It is set in each node's
+#     firmware and arrives in every frame header (docs/protocol-spec.md section
+#     1). The backend NEVER auto-assigns, reassigns, or rewrites it -- a row here
+#     is created the first time a given node_id is heard and keyed by it forever.
+#     It is what (node_id, seq_num) uniqueness on `readings` and all
+#     WebSocket / REST `node_id=` filtering key off.
+#   * `name` is a purely cosmetic, operator-editable label (PATCH /nodes/{id}).
+#     It has NO bearing on frame routing, the (node_id, seq_num) constraint, or
+#     any API/WebSocket filtering -- rename freely, nothing downstream moves.
+#   * Ensuring node_id is unique across physical devices is the operator's job,
+#     done when flashing firmware. The backend does not detect or warn on a
+#     collision: two physical nodes transmitting the same node_id are folded into
+#     one row (their frames interleave, and the seq_num-restart heuristic in
+#     db/writer.py will likely thrash). See docs/protocol-spec.md section 6.
 class Node(Base):
     """A telemetry node we have heard from at least once."""
 
@@ -78,6 +94,9 @@ class Node(Base):
     last_seen: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, nullable=False
     )
+    # Operator-assigned display name. Nullable: unset nodes fall back to
+    # "Node {node_id}", computed on read (api/nodes.py), never stored.
+    name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # status ("online"/"offline") is derived from last_seen at read time -- see
     # api/nodes.py. It is deliberately NOT a column.
 

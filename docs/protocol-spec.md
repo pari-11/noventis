@@ -36,6 +36,23 @@ Offset  Size  Field         Notes
   `SYNC + header + payload`. Unlike many designs, `SYNC` **is** included in the
   CRC here, matching the production firmware.
 
+### `NODE_ID` vs. node name
+
+`NODE_ID` is the **fixed, protocol-level identifier** for a node. It is set in
+the node's firmware when it is flashed and is present in every frame header. The
+backend never auto-assigns, reassigns, or rewrites it: the first frame with a
+given `NODE_ID` creates that node's row (keyed by `NODE_ID`), and it is what the
+`(node_id, seq_num)` uniqueness constraint on `readings` and **all**
+WebSocket / REST `node_id=` filtering key off.
+
+The **node name** (`nodes.name`, set via `PATCH /nodes/{node_id}`) is a purely
+cosmetic, operator-editable label. It has **no** bearing on frame routing, the
+`(node_id, seq_num)` constraint, or any API / WebSocket filtering — it exists
+only so the dashboard can show something friendlier than a bare number.
+
+Keeping `NODE_ID` unique across physical devices is the **operator's
+responsibility**, handled when flashing each node's firmware (see §6).
+
 ### Stream framing (receiver side)
 
 The serial link is a raw byte stream. `protocol.extract_frames(buffer)` (a
@@ -175,6 +192,14 @@ output is byte-identical to the original inline construction.
   ambiguous against deployed nodes.
 - No per-node timestamp in the frame; ingestion timestamps on receipt.
 - No battery / uptime / temperature telemetry yet.
+- **Firmware `NODE_ID` collisions are not detected.** If two physical nodes are
+  flashed with the same `NODE_ID`, the backend folds them into one node row:
+  their frames interleave under one identity, `raw_frames` still logs every
+  packet, but `readings` and the live stream become an unusable mix (and the
+  `seq_num`-restart heuristic in `backend/db/writer.py` will likely thrash,
+  repeatedly clearing that node's readings). Uniqueness is the operator's
+  responsibility at flash time; a future wire revision could add a hardware
+  UID / boot nonce to let the backend flag this.
 - `seq_num` is 16-bit and wraps roughly every 9 hours at 2 Hz; the
   `(node_id, seq_num)` uniqueness in `readings` assumes re-ingestion windows
   shorter than one wrap. A **node reboot** resets `seq_num` to ~0 mid-wrap, which
@@ -193,3 +218,4 @@ output is byte-identical to the original inline construction.
 |---------|------------|--------------------------------------------------------------|
 | 1       | 2026-08-30 | Initial spec — documents the shipped `0xAA55` frame format.  |
 | 2       | 2026-08-31 | §3: document the derived `tof_out_of_range` key (backend-side, not on the wire; codec and both `protocol.py` modules unchanged). |
+| 3       | 2026-09-01 | §1/§6: document the `NODE_ID` (firmware-fixed, routing key) vs. node `name` (cosmetic label) invariant and that firmware `NODE_ID` collisions are not detected. Docs only — no wire or behaviour change. |

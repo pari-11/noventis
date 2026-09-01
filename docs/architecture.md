@@ -64,7 +64,7 @@ pyserial or touches the port. If one is slow or crashes, the other is unaffected
 
 | Table        | Purpose                        | Key columns                                                   | Constraints |
 |--------------|--------------------------------|--------------------------------------------------------------|-------------|
-| `nodes`      | known nodes                    | `node_id` PK, `last_seen`                                     | `status` computed on read, never stored |
+| `nodes`      | known nodes                    | `node_id` PK, `last_seen`, `name` (nullable)                  | `status` computed on read, never stored; `name` falls back to `"Node {id}"` on read when NULL |
 | `raw_frames` | forensic log of every packet   | `id` PK, `node_id` (nullable), `received_at`, `crc_ok`, `raw` | index on `received_at`, `node_id` |
 | `readings`   | CRC-valid decoded values only  | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `tof_out_of_range` (derived), `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
 
@@ -92,7 +92,16 @@ writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
 | GET    | `/nodes`                    | all nodes + computed `status`                          |
 | GET    | `/readings?node_id=<id>`    | CRC-valid readings, newest first, paginated            |
 | GET    | `/raw-frames?node_id=<id>`  | forensic log; `node_id` optional (NULL for bad header) |
+| PATCH  | `/nodes/{node_id}`          | set display name; body `{"name": "<1..64 chars>"}`; returns the updated node (404 unknown node, 422 blank name) |
+| POST   | `/rescan`                   | force serial CP2102 auto-detect to re-run; waits a bounded window and returns `{ok, connected, port, last_error}` |
 | WS     | `/live?node_id=<id>`        | stream of CRC-valid readings; omit `node_id` for all   |
+
+`POST /rescan` sets a flag on the `SerialReader` background thread
+(`request_rescan()`), which drops any open port and re-runs `select_port` on its
+next loop pass (within a read timeout). The handler then polls `reader.status()`
+for up to `NOVENTIS_RESCAN_WAIT_S` (default 4 s) so the response reflects the
+real reconnect outcome, not a timer. Still the only pyserial user is
+`ingest/serial_reader.py`.
 
 ## Wire protocol
 

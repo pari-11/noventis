@@ -104,7 +104,7 @@ app = FastAPI(title="Noventis", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -142,6 +142,45 @@ async def health() -> dict:
 async def session_info() -> dict:
     """When the current backend run began. Resets on restart (no persistence)."""
     return {"session_start": SESSION_START_TS.isoformat()}
+
+
+# How long POST /rescan waits for the reader thread to (re)connect before it
+# reports failure. The thread reacts within a read timeout (~0.2 s) and a present
+# adapter reopens well inside this window.
+RESCAN_WAIT_S = float(os.getenv("NOVENTIS_RESCAN_WAIT_S", "4"))
+
+
+@app.post("/rescan", tags=["meta"])
+async def rescan_ports() -> dict:
+    """Re-run CP2102 serial auto-detection now and report the real outcome.
+
+    Forces the background serial reader to drop any open port and re-scan (the
+    same discovery it does on startup / when the adapter drops), then waits a
+    bounded window for it to reconnect. The dashboard's "Rescan for nodes"
+    button drives its idle -> reconnecting -> success | failure states off this
+    response, not a timer.
+    """
+    reader = app.state.reader
+    reader.request_rescan()
+
+    loop = asyncio.get_running_loop()
+    # let the thread actually drop the current port before we start checking, so
+    # the happy path reflects a genuine reconnect rather than the stale state
+    await asyncio.sleep(0.5)
+    deadline = loop.time() + RESCAN_WAIT_S
+    while loop.time() < deadline:
+        st = reader.status()
+        if st["connected"]:
+            return {"ok": True, "connected": True, "port": st["port"], "last_error": None}
+        await asyncio.sleep(0.25)
+
+    st = reader.status()
+    return {
+        "ok": False,
+        "connected": st["connected"],
+        "port": st["port"],
+        "last_error": st["last_error"],
+    }
 
 
 @app.websocket("/live")

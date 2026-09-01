@@ -5,11 +5,18 @@
  * LiveChart and HistoryPanel. Polls GET /health every 5s and shows whether the
  * backend's LoRa serial port is currently connected.
  *
- * node = "all"  -> full-width grid of NodeSummaryCards (no chart, no history).
+ * Also owns:
+ *   - the light/dark theme (persisted to localStorage, applied as
+ *     <html data-theme>), toggled from the header. Dark is the default.
+ *   - the header "Rescan for nodes" control: POSTs /rescan (which re-runs the
+ *     backend serial auto-detect) and drives a four-state machine
+ *     idle -> reconnecting -> success | failure off the real response.
+ *
+ * node = "all"  -> grid of NodeSummaryCards (no chart, no history).
  * node selected -> LiveChart + HistoryPanel side by side.
  */
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { NodeSelector, type NodeInfo } from './components/NodeSelector'
 import { LiveChart } from './components/LiveChart'
 import { HistoryPanel } from './components/HistoryPanel'
@@ -28,12 +35,61 @@ type Health = {
   nodes_seen: number
 }
 
+type RescanState = 'idle' | 'reconnecting' | 'success' | 'failure'
+
+const Icon = ({ d, size = 15 }: { d: string; size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d={d} />
+  </svg>
+)
+const I = {
+  refresh: 'M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6',
+  sun: 'M12 4V2m0 20v-2m8-8h2M2 12h2m13.7-5.7 1.4-1.4M4.9 19.1l1.4-1.4m11.4 0 1.4 1.4M4.9 4.9l1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z',
+}
+
 export default function App() {
   const [nodeId, setNodeId] = useState<number | null>(null)
   const [health, setHealth] = useState<Health | null>(null)
   const [healthErr, setHealthErr] = useState<string | null>(null)
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [now, setNow] = useState(() => Date.now())
+
+  const [theme, setTheme] = useState<'light' | 'dark'>(
+    () => (localStorage.getItem('noventis-theme') === 'light' ? 'light' : 'dark'),
+  )
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('noventis-theme', theme)
+  }, [theme])
+
+  const [rescan, setRescan] = useState<RescanState>('idle')
+  const rescanTimer = useRef<number | undefined>(undefined)
+  useEffect(() => () => window.clearTimeout(rescanTimer.current), [])
+
+  const doRescan = useCallback(async () => {
+    setRescan('reconnecting')
+    window.clearTimeout(rescanTimer.current)
+    try {
+      const res = await fetch('/rescan', { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = (await res.json()) as { ok?: boolean; connected?: boolean }
+      setRescan((data.ok ?? data.connected) ? 'success' : 'failure')
+    } catch {
+      setRescan('failure')
+    }
+    rescanTimer.current = window.setTimeout(() => setRescan('idle'), 4000)
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -60,10 +116,10 @@ export default function App() {
     }
   }, [])
 
-  // summary grid only shows in the "all nodes" view -- poll /nodes and keep a
-  // 1s clock running only while it is visible.
+  // poll /nodes -- feeds the "all nodes" summary grid AND the selected node's
+  // display name (shown in the LiveChart / HistoryPanel headers). Re-fetches
+  // immediately on a node switch so a rename shows without waiting for the tick.
   useEffect(() => {
-    if (nodeId != null) return
     let alive = true
     const load = () =>
       fetch('/nodes')
@@ -89,6 +145,17 @@ export default function App() {
   }, [nodeId])
 
   const lora = health?.lora
+  const selectedName =
+    nodeId == null ? undefined : nodes.find((n) => n.node_id === nodeId)?.name
+
+  const rescanLabel =
+    rescan === 'reconnecting'
+      ? 'Rescanning…'
+      : rescan === 'success'
+        ? 'Rescan complete'
+        : rescan === 'failure'
+          ? 'No adapter found'
+          : 'Rescan for nodes'
 
   return (
     <div className="app">
@@ -96,13 +163,13 @@ export default function App() {
         <h1>Noventis</h1>
         <div className="conn">
           {healthErr ? (
-            <span className="pill down">backend unreachable</span>
+            <span className="ws-badge closed">backend unreachable</span>
           ) : lora ? (
-            <span className={lora.connected ? 'pill up' : 'pill down'}>
+            <span className={lora.connected ? 'ws-badge open' : 'ws-badge closed'}>
               LoRa {lora.connected ? `connected · ${lora.port}` : 'disconnected'}
             </span>
           ) : (
-            <span className="pill">checking…</span>
+            <span className="ws-badge">checking…</span>
           )}
           {health && <span className="muted small">{health.nodes_seen} node(s) seen</span>}
           {lora?.connected && (
@@ -111,35 +178,47 @@ export default function App() {
             </span>
           )}
           {lora && !lora.connected && lora.last_error && (
-            <span className="muted small">{lora.last_error}</span>
+            <span className="muted small conn-msg">{lora.last_error}</span>
           )}
+          <button
+            className={rescan === 'reconnecting' ? 'btn ghost-btn spinning' : 'btn ghost-btn'}
+            onClick={() => void doRescan()}
+            disabled={rescan === 'reconnecting'}
+            title="Rescan serial ports for the LoRa base station"
+          >
+            <Icon d={I.refresh} size={14} />
+            {rescanLabel}
+          </button>
         </div>
+        <button
+          className="btn icon-btn"
+          onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          aria-label="Toggle colour theme"
+        >
+          <Icon d={theme === 'dark' ? I.sun : I.moon} size={18} />
+        </button>
       </header>
 
       <NodeSelector value={nodeId} onChange={setNodeId} />
 
       {nodeId == null ? (
         <main>
-          <section className="card">
-            <header className="card-head">
-              <h2>All nodes</h2>
-              <span className="muted small">{nodes.length} node(s)</span>
-            </header>
-            {nodes.length === 0 ? (
-              <p className="muted small">no nodes seen yet</p>
-            ) : (
-              <div className="summary-grid">
-                {nodes.map((n) => (
-                  <NodeSummaryCard key={n.node_id} node={n} now={now} onSelect={setNodeId} />
-                ))}
-              </div>
-            )}
-          </section>
+          <h2 className="section-title">All nodes</h2>
+          {nodes.length === 0 ? (
+            <p className="muted small">no nodes seen yet</p>
+          ) : (
+            <div className="summary-grid">
+              {nodes.map((n) => (
+                <NodeSummaryCard key={n.node_id} node={n} now={now} onSelect={setNodeId} />
+              ))}
+            </div>
+          )}
         </main>
       ) : (
         <main className="grid">
-          <LiveChart key={nodeId} nodeId={nodeId} />
-          <HistoryPanel nodeId={nodeId} />
+          <LiveChart key={nodeId} nodeId={nodeId} nodeName={selectedName} />
+          <HistoryPanel nodeId={nodeId} nodeName={selectedName} />
         </main>
       )}
     </div>

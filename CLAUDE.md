@@ -62,8 +62,9 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
    Nothing outside `backend/ingest/` may import pyserial or touch the serial port.
 
 5. **Data model:**
-   - `nodes`: `node_id`, `last_seen`; `status` is **computed on read, never
-     stored**.
+   - `nodes`: `node_id`, `last_seen`, `name` (nullable, operator-set via
+     `PATCH /nodes/{id}`; renders as `"Node {id}"` on read when NULL);
+     `status` is **computed on read, never stored**.
    - `raw_frames`: every packet received, `crc_ok` pass/fail, nullable `node_id`
      -- a forensic log.
    - `readings`: CRC-valid decoded values only; index `(node_id, timestamp)`;
@@ -82,6 +83,11 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
 
 7. **API contract:**
    - REST: `GET /nodes`, `GET /readings?node_id=...`, `GET /raw-frames?node_id=...`
+   - `PATCH /nodes/{node_id}` -- body `{"name": "..."}`, sets the display name,
+     returns the updated node
+   - `POST /rescan` -- re-runs the `serial_reader` CP2102 auto-detect
+     (`SerialReader.request_rescan()`), waits a bounded window, returns
+     `{ok, connected, port, last_error}`. Does not touch pyserial itself.
    - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes)
 
 8. Keep this file and the two `@`-referenced docs in sync when any of the above
