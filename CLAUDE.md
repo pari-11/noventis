@@ -77,8 +77,10 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
 
 5. **Data model:**
    - `nodes`: `node_id`, `last_seen`, `name` (nullable, operator-set via
-     `PATCH /nodes/{id}`; renders as `"Node {id}"` on read when NULL);
-     `status` is **computed on read, never stored**.
+     `PATCH /nodes/{id}`; renders as `"Node {id}"` on read when NULL). A boolean
+     `stale` (last frame older than `NOVENTIS_STALE_AFTER_S`, default 10 s) is
+     **computed on read, never stored** -- there is no online/offline enum and
+     no `NODE_TIMEOUT`.
    - `raw_frames`: **CRC-failed frames only**, nullable `node_id` -- a small
      forensic log, left unpruned (~12/24k). CRC-valid frames are **not**
      persisted: the most recent `RAW_FRAME_BUFFER_SIZE` (default 5000) live in
@@ -118,13 +120,17 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
    Alembic yet -- `Base.metadata.create_all` is fine at this stage.
 
 7. **API contract:**
-   - REST: `GET /nodes`, `GET /readings?node_id=...`, `GET /raw-frames?node_id=...`
+   - REST: `GET /nodes`, `GET /readings?node_id=...`, `GET /raw-frames?node_id=...`,
+     `GET /session` (returns `{session_start}` -- when this backend run began;
+     resets on restart, not persisted)
    - `GET /readings` transparently merges `readings` + `readings_rollup`: when
      `since` reaches past `READINGS_FULL_RES_HOURS` the older portion comes from
      the rollup tier (rows flagged `rollup: true`, with `sample_count`; values
      are the bucket average). Callers don't pick a table.
    - `GET /debug/frames?limit=&crc_ok=&node_id=` -- window onto the in-memory
-     frame ring buffer; same row shape as `/raw-frames` (id is the ring's `seq`).
+     frame ring buffer; same fields as `/raw-frames` except the row id is `seq`
+     (the ring's monotonic counter), not `id`. `limit` caps at
+     `RAW_FRAME_BUFFER_SIZE`, not 2000.
    - `GET /health` also reports `frame_buffer` (size/capacity) and `retention`
      (passes, buckets_written, readings_rolled_up, auto_vacuum_mode, ...).
    - `PATCH /nodes/{node_id}` -- body `{"name": "..."}`, sets the display name,
@@ -132,7 +138,10 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
    - `POST /rescan` -- re-runs the `serial_reader` CP2102 auto-detect
      (`SerialReader.request_rescan()`), waits a bounded window, returns
      `{ok, connected, port, last_error}`. Does not touch pyserial itself.
-   - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes)
+   - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes). On
+     connect the server sends `{"type": "ready", "node_id": ...}`, then one JSON
+     message per CRC-valid frame: `{node_id, seq_num, ts, values}` (`ts` is an
+     ISO-8601 string).
 
 8. Keep this file and the two `@`-referenced docs in sync when any of the above
    changes, so future sessions don't have to be re-told.

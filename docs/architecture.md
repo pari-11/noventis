@@ -84,7 +84,7 @@ unaffected.
 
 | Table        | Purpose                        | Key columns                                                   | Constraints |
 |--------------|--------------------------------|--------------------------------------------------------------|-------------|
-| `nodes`      | known nodes                    | `node_id` PK, `last_seen`, `name` (nullable)                  | `status` computed on read, never stored; `name` falls back to `"Node {id}"` on read when NULL |
+| `nodes`      | known nodes                    | `node_id` PK, `last_seen`, `name` (nullable)                  | `stale` bool computed on read, never stored; `name` falls back to `"Node {id}"` on read when NULL |
 | `raw_frames` | forensic log of **CRC-failed** frames only | `id` PK, `node_id` (nullable), `received_at`, `crc_ok`, `raw` | index on `received_at`, `node_id`; grows negligibly (~12/24k), left unpruned |
 | `readings`   | CRC-valid decoded values, full-res, last `READINGS_FULL_RES_HOURS` | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `tof_out_of_range` (derived), `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
 | `readings_rollup` | per-node time-bucket aggregates of `readings` older than that window | `id` PK, `node_id`, `bucket_start`, `sample_count`, `tof_mm_{avg,min,max}`, `accel_{x,y,z}_{avg,min,max}`, `gyro_{x,y,z}_{avg,min,max}` | index + **unique `(node_id, bucket_start)`** |
@@ -137,8 +137,10 @@ gap of silence is a restart, and it clears that node's `readings` so the new
 session ingests. `writer.status().sessions_reset` counts how often it has fired.
 (It does not touch `readings_rollup`; historical buckets survive a reset.)
 
-Node `status` is derived: `online` if `now - last_seen <= NODE_TIMEOUT`
-(env-configured, default ~30 s), else `offline`.
+Node liveness is derived on read, never stored: `GET /nodes` returns a boolean
+`stale`, true when `now - last_seen` exceeds `NOVENTIS_STALE_AFTER_S`
+(default 10 s). There is no online/offline enum and no `NODE_TIMEOUT`; the
+`NodeOut` shape is `{node_id, name, last_seen, stale}`.
 
 Persistence: SQLAlchemy async ORM, SQLite in **WAL mode** (concurrent
 writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
@@ -147,13 +149,14 @@ writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
 
 | Method | Path                        | Notes                                                   |
 |--------|-----------------------------|--------------------------------------------------------|
-| GET    | `/nodes`                    | all nodes + computed `status`                          |
+| GET    | `/nodes`                    | all nodes + computed `stale` bool (see below)          |
+| GET    | `/session`                  | `{session_start}` — when this backend run began; resets on restart, not persisted |
 | GET    | `/readings?node_id=<id>`    | readings newest first, paginated; when `since` reaches past `READINGS_FULL_RES_HOURS` the older portion is served from `readings_rollup`, merged transparently (bucketed rows carry `rollup: true` + `sample_count`) |
 | GET    | `/raw-frames?node_id=<id>`  | `raw_frames` table -- CRC-failed frames only now; `node_id` optional (NULL for bad header) |
 | GET    | `/debug/frames`             | window onto the in-memory frame ring buffer (recent frames, CRC pass + fail); `limit`, `crc_ok`, `node_id` filters; empty after a restart |
 | PATCH  | `/nodes/{node_id}`          | set display name; body `{"name": "<1..64 chars>"}`; returns the updated node (404 unknown node, 422 blank name) |
 | POST   | `/rescan`                   | force serial CP2102 auto-detect to re-run; waits a bounded window and returns `{ok, connected, port, last_error}` |
-| WS     | `/live?node_id=<id>`        | stream of CRC-valid readings; omit `node_id` for all   |
+| WS     | `/live?node_id=<id>`        | sends `{"type":"ready","node_id":…}` on connect, then one JSON message per CRC-valid frame (`{node_id, seq_num, ts, values}`, `ts` ISO-8601); omit `node_id` for all |
 
 `GET /health` additionally reports `frame_buffer` (ring `size`/`capacity`/
 `received_total`) and `retention` (`passes`, `buckets_written`,
