@@ -9,18 +9,23 @@ Lifespan startup, in order:
   1. init_db()                       -- create_all + WAL pragmas
   2. DBWriter.start()                -- subscribes to the event bus
   3. ConnectionManager.start()       -- subscribes to the event bus (independently)
-  4. SerialReader.start()            -- owns the CP2102 port in a background thread;
+  4. FrameRingBuffer.start()         -- subscribes to the event bus (independently);
+                                        in-memory ring of recent frames
+  5. RetentionJob.start()            -- periodic readings rollup + retention
+  6. SerialReader.start()            -- owns the CP2102 port in a background thread;
                                         publishes frames onto the bus via a
                                         loop-safe bridge
 
 Shutdown tears them down in reverse and disposes the DB engine.
 
 Routes:
-  GET  /health                     -- LoRa port connected? how many nodes seen?
+  GET  /health                     -- LoRa port connected? nodes seen? writer /
+                                      retention counters, ring-buffer size
   GET  /session                    -- when this backend run started (SESSION_START_TS)
   GET  /nodes                      -- api/nodes.py
-  GET  /readings?node_id=...       -- api/readings.py
-  GET  /raw-frames?node_id=...     -- api/raw_frames.py
+  GET  /readings?node_id=...       -- api/readings.py (readings + readings_rollup, merged)
+  GET  /raw-frames?node_id=...     -- api/raw_frames.py (CRC-failed frames only now)
+  GET  /debug/frames               -- api/debug.py (in-memory ring buffer window)
   WS   /live?node_id=...           -- ws/manager.py (omit node_id for all nodes)
 
 Only ingest/serial_reader.py touches pyserial; every other component sees the
@@ -39,11 +44,13 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 
-from .api import nodes, raw_frames, readings
+from .api import debug, nodes, raw_frames, readings
 from .db.models import Node
+from .db.retention import RetentionJob
 from .db.session import SessionLocal, dispose, init_db
 from .db.writer import DBWriter
 from .ingest.event_bus import bus
+from .ingest.frame_buffer import FrameRingBuffer
 from .ingest.serial_reader import (
     SerialReader,
     loop_safe_publisher,
@@ -75,9 +82,14 @@ async def lifespan(app: FastAPI):
 
     writer = DBWriter(bus)
     ws_manager = ConnectionManager(bus)
+    frame_buffer = FrameRingBuffer(bus)
     writer.start()
     ws_manager.start()
-    await asyncio.sleep(0)  # let both tasks reach bus.subscribe() before frames flow
+    frame_buffer.start()
+    await asyncio.sleep(0)  # let the subscriber tasks reach bus.subscribe() before frames flow
+
+    retention = RetentionJob()
+    retention.start()
 
     reader = SerialReader(
         publish=loop_safe_publisher(asyncio.get_running_loop(), bus.publish),
@@ -88,12 +100,16 @@ async def lifespan(app: FastAPI):
     app.state.reader = reader
     app.state.writer = writer
     app.state.ws_manager = ws_manager
+    app.state.frame_buffer = frame_buffer
+    app.state.retention = retention
     log.info("noventis backend started (CORS origins: %s)", CORS_ORIGINS or "none")
 
     try:
         yield
     finally:
         await asyncio.to_thread(reader.stop)
+        await retention.stop()
+        await frame_buffer.stop()
         await ws_manager.stop()
         await writer.stop()
         await dispose()
@@ -111,6 +127,7 @@ app.add_middleware(
 app.include_router(nodes.router)
 app.include_router(readings.router)
 app.include_router(raw_frames.router)
+app.include_router(debug.router)
 
 
 @app.get("/health", tags=["meta"])
@@ -135,6 +152,8 @@ async def health() -> dict:
         "writer": app.state.writer.status(),
         "ws": app.state.ws_manager.status(),
         "bus": bus.status(),
+        "frame_buffer": app.state.frame_buffer.status(),
+        "retention": app.state.retention.status(),
     }
 
 

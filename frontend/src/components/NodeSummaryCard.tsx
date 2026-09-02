@@ -3,8 +3,9 @@
  *
  * Numbers only, no chart: live/stale badge (from GET /nodes' computed `stale`),
  * latest ToF + how long ago it landed, last seq_num, ok/total CRC ratio over the
- * last 500 raw frames, and last-seen time. The whole card is a button: clicking
- * it selects that node (same as NodeSelector).
+ * last 500 frames (from GET /debug/frames -- the in-memory ring buffer that
+ * replaced the raw_frames table for CRC-valid frames), and last-seen time. The
+ * whole card is a button: clicking it selects that node (same as NodeSelector).
  */
 
 import { useEffect, useState } from 'react'
@@ -44,7 +45,7 @@ export function NodeSummaryCard({ node, now, onSelect }: Props) {
       try {
         const [rRes, fRes] = await Promise.all([
           fetch(`/readings?node_id=${id}&limit=1`),
-          fetch(`/raw-frames?node_id=${id}&limit=${RAW_WINDOW}`),
+          fetch(`/debug/frames?node_id=${id}&limit=${RAW_WINDOW}`),
         ])
         if (alive && rRes.ok) {
           const rows = (await rRes.json()) as Reading[]

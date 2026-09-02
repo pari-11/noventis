@@ -20,6 +20,7 @@ export default defineConfig({
       '/nodes': BACKEND,
       '/readings': BACKEND,
       '/raw-frames': BACKEND,
+      '/debug': BACKEND,
       '/live': { target: WS_BACKEND, ws: true },
     },
   },

@@ -4,17 +4,25 @@ backend/db/models.py -- SQLAlchemy 2.0 async ORM models.
 Target: SQLite in WAL mode. No Alembic yet (constraint #6) -- schema is created
 with `Base.metadata.create_all` from db/session.py:init_db().
 
-Three tables (see docs/architecture.md "Data model"):
+Tables (see docs/architecture.md "Data model"):
 
-  nodes       one row per known node. `status` is COMPUTED on read (api/nodes.py),
-              never stored.
-  raw_frames  forensic log -- EVERY candidate frame off the wire, CRC pass or
-              fail, node_id nullable (header may be unparseable).
-  readings    CRC-valid decoded values only. Indexed on (node_id, timestamp).
-              UNIQUE (node_id, seq_num) makes re-ingestion idempotent.
+  nodes           one row per known node. `status` is COMPUTED on read
+                  (api/nodes.py), never stored.
+  raw_frames      forensic log -- CRC-*failed* candidate frames only (rare;
+                  ~12 per 24k). CRC-valid frames are NOT stored here any more:
+                  they live for ~40 min in the in-memory ring buffer
+                  (ingest/frame_buffer.py) and nowhere on disk. node_id nullable
+                  (header may be unparseable). Left unpruned -- the failure rate
+                  is low enough that weeks of corruption-pattern history costs
+                  almost nothing.
+  readings        CRC-valid decoded values, full resolution, for the last
+                  READINGS_FULL_RES_HOURS. Indexed on (node_id, timestamp).
+                  UNIQUE (node_id, seq_num) makes re-ingestion idempotent.
+  readings_rollup per-node time-bucket aggregates (avg + min + max) of readings
+                  older than that window; the originals are deleted once rolled
+                  up. Single tier -- see db/retention.py.
 
 TODO:
-  - [ ] Add a retention/rollup story for raw_frames (it grows fast).
   - [ ] Confirm node_id domain: protocol NODE_ID is uint8 (1..254).
   - [ ] Store raw int16 fixed-point instead of decoded floats? (lossless replay)
 """
@@ -102,7 +110,14 @@ class Node(Base):
 
 
 class RawFrame(Base):
-    """Every candidate frame received -- the forensic log. Never pruned here."""
+    """CRC-*failed* candidate frames -- the forensic log.
+
+    Since the raw-frame storage model changed, ``db/writer.py`` only INSERTs here
+    when ``crc_ok`` is False. Those frames are rare and tiny, carry the only
+    long-term diagnostic value (spotting corruption patterns over weeks), and
+    need no retention job. CRC-valid frames are held transiently in
+    ``ingest/frame_buffer.FrameRingBuffer`` instead (see ``GET /debug/frames``).
+    """
 
     __tablename__ = "raw_frames"
 
@@ -145,4 +160,55 @@ class Reading(Base):
     __table_args__ = (
         UniqueConstraint("node_id", "seq_num", name="uq_readings_node_seq"),
         Index("ix_readings_node_ts", "node_id", "timestamp"),
+    )
+
+
+class ReadingRollup(Base):
+    """One time-bucket of aggregated readings for a node.
+
+    ``db/retention.py`` groups readings older than ``READINGS_FULL_RES_HOURS``
+    into ``ROLLUP_INTERVAL_MINUTES`` buckets per node, writes one row here per
+    (node, bucket), and deletes the originals.
+
+    min/max are stored **alongside** avg, not instead of it: averaging a
+    one-minute bucket of IMU data erases exactly the short accel/gyro spikes that
+    are the interesting part of that signal. min/max keeps "did something happen
+    in this minute" at negligible cost. Single tier -- no coarser rollup on top.
+    """
+
+    __tablename__ = "readings_rollup"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # start of the bucket: reading timestamp truncated to ROLLUP_INTERVAL_MINUTES.
+    bucket_start: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    tof_mm_avg: Mapped[float | None] = mapped_column(Float)
+    tof_mm_min: Mapped[int | None] = mapped_column(Integer)
+    tof_mm_max: Mapped[int | None] = mapped_column(Integer)
+
+    accel_x_avg: Mapped[float | None] = mapped_column(Float)
+    accel_x_min: Mapped[float | None] = mapped_column(Float)
+    accel_x_max: Mapped[float | None] = mapped_column(Float)
+    accel_y_avg: Mapped[float | None] = mapped_column(Float)
+    accel_y_min: Mapped[float | None] = mapped_column(Float)
+    accel_y_max: Mapped[float | None] = mapped_column(Float)
+    accel_z_avg: Mapped[float | None] = mapped_column(Float)
+    accel_z_min: Mapped[float | None] = mapped_column(Float)
+    accel_z_max: Mapped[float | None] = mapped_column(Float)
+
+    gyro_x_avg: Mapped[float | None] = mapped_column(Float)
+    gyro_x_min: Mapped[float | None] = mapped_column(Float)
+    gyro_x_max: Mapped[float | None] = mapped_column(Float)
+    gyro_y_avg: Mapped[float | None] = mapped_column(Float)
+    gyro_y_min: Mapped[float | None] = mapped_column(Float)
+    gyro_y_max: Mapped[float | None] = mapped_column(Float)
+    gyro_z_avg: Mapped[float | None] = mapped_column(Float)
+    gyro_z_min: Mapped[float | None] = mapped_column(Float)
+    gyro_z_max: Mapped[float | None] = mapped_column(Float)
+
+    __table_args__ = (
+        UniqueConstraint("node_id", "bucket_start", name="uq_rollup_node_bucket"),
+        Index("ix_rollup_node_bucket", "node_id", "bucket_start"),
     )
