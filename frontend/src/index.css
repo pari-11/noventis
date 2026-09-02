@@ -333,6 +333,17 @@ tbody tr:last-child td { border-bottom: none; }
 
 /* --- live chart panel --- */
 .lc-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 12px; flex-wrap: wrap; }
+.lc-toolbar-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* compact plot caption -- stays on one line so it and "back to live" share the row */
+.lc-plot-cap { white-space: nowrap; }
+.lc-canvas-wrap { position: relative; }
+.lc-canvas-wait {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  background: color-mix(in oklab, var(--card) 72%, transparent);
+  border-radius: 12px;
+  pointer-events: none;
+}
 .lc-canvas {
   width: 100%;
   height: 320px;
@@ -361,6 +372,10 @@ tbody tr:last-child td { border-bottom: none; }
 .lc-stat-sel.alt { border-color: var(--accent-2); background: color-mix(in oklab, var(--accent-2) 12%, transparent); }
 .lc-stat.warn { border-color: color-mix(in oklab, var(--accent-2) 55%, transparent); }
 .lc-stat.warn .lc-stat-val { color: var(--accent-2); }
+/* a series with no data yet: present but de-emphasised, still clickable */
+.lc-stat-empty { opacity: 0.5; border-style: dashed; background: transparent; }
+.lc-stat-empty .lc-stat-val { color: var(--muted); }
+.lc-stat-empty:hover { opacity: 0.8; }
 .lc-stat-val { font-family: var(--font-num); font-size: 26px; font-weight: 400; letter-spacing: -0.02em; line-height: 1.1; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .lc-stat-unit { font-family: var(--font-num); font-size: 12px; font-weight: 400; color: var(--muted); }
 .lc-stat-label { font-family: var(--font-sans); font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }

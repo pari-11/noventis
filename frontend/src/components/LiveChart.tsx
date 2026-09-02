@@ -28,13 +28,17 @@
  *
  * ToF handling (see backend TOF_MAX_VALID_MM): the VL53L0X "no target" sentinel
  * (~8190 mm) arrives flagged `tof_out_of_range`. Those points are NOT fed into
- * the ToF line as a distance -- the line breaks (whitespace gap) and a dot
- * is drawn instead, so one bogus reading can't blow out the y-axis.
+ * the ToF line as a distance -- in BOTH raw and smoothed views the line breaks
+ * (whitespace gap) and a separate out-of-range overlay series (its own `--down`
+ * colour, never the ToF / smoothed line colour) is drawn instead: dots for lone
+ * sentinels, a joined segment for consecutive ones. One bogus reading can't
+ * blow out the y-axis.
  *
- * Distance threshold alert: a collapsible min/max mm control next to the stat
- * tiles. While open, if the live ToF value falls outside [min, max] the ToF
- * stat tile's value is drawn in the secondary accent colour. Pure client-side
- * comparison against the already-streaming value -- no backend involvement.
+ * Distance threshold alert: a collapsible min/max mm control, toggled from a
+ * button inline with the Raw/Smoothed toggle. While open, if the live ToF value
+ * falls outside [min, max] the ToF stat tile's value is drawn in the secondary
+ * accent colour. Pure client-side comparison against the already-streaming
+ * value -- no backend involvement.
  *
  * Raw / Smoothed toggle: "Smoothed" is display-only. It applies a trailing
  * rolling median (window 11) followed by a short trailing moving average
@@ -313,13 +317,17 @@ export function LiveChart({ nodeId, nodeName }: Props) {
   const tofAlert =
     thrOpen && !current.tofOor && current.tof != null && (current.tof < thr.min || current.tof > thr.max)
 
-  // if the charted series goes away (e.g. only ToF is arriving), fall back
+  // While collapsed, keep the readout pointed at a series that actually has
+  // data (e.g. only ToF is arriving). Once the chart is expanded we respect an
+  // explicit tile pick even if that series has no data yet -- the chart then
+  // shows a "waiting for data" state instead of yanking the selection away.
   useEffect(() => {
+    if (expanded) return
     if (!available[series]) {
       const first = SERIES_KEYS.find((k) => available[k])
       if (first) setSeries(first)
     }
-  }, [available, series])
+  }, [available, series, expanded])
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -388,12 +396,15 @@ export function LiveChart({ nodeId, nodeName }: Props) {
         return { ...r, priceRange: { minValue: mid - need / 2, maxValue: mid + need / 2 } }
       },
     })
-    // ToF out-of-range markers: dots only, pinned to the price scale, excluded
-    // from its autoscale so they never widen the axis. Empty for accel/gyro.
+    // ToF out-of-range overlay: always drawn in the dedicated `--down` colour
+    // (never the ToF / smoothed line colour), in BOTH raw and smoothed views.
+    // Lone sentinels show as dots; consecutive ones join into a short segment.
+    // Pinned to the price scale but excluded from its autoscale so they never
+    // widen the axis. Empty for accel/gyro.
     oorRef.current = chart.addLineSeries({
       color: c.oor,
-      lineWidth: 1,
-      lineVisible: false,
+      lineWidth: 2,
+      lineVisible: true,
       pointMarkersVisible: true,
       pointMarkersRadius: 3,
       priceScaleId: 'right',
@@ -464,7 +475,7 @@ export function LiveChart({ nodeId, nodeName }: Props) {
 
     const pts = samplesFor(win, series)
     let lineData: (LineData | WhitespaceData)[] = pts
-    let oorData: LineData[] = []
+    let oorData: (LineData | WhitespaceData)[] = []
 
     if (mode === 'smoothed' && pts.length > 0) {
       const s = smooth(pts.map((p) => p.value))
@@ -472,13 +483,28 @@ export function LiveChart({ nodeId, nodeName }: Props) {
     }
 
     if (series === 'tof') {
-      const oorTimes = win.filter((f) => f.tof != null && f.tofOor).map((f) => f.time)
-      // dots ride the current in-range ceiling (autoscaleInfoProvider keeps them
-      // out of the scale maths); the line gets a whitespace gap at each OOR time
-      // so it breaks instead of plunging to a fake ~8190 mm.
+      // Build the out-of-range overlay from the raw frames, independent of the
+      // raw/smoothed mode: consecutive sentinels join into a `--down` segment,
+      // isolated ones stay dots (a whitespace point breaks the overlay between
+      // separate runs). Dots/segments ride the current in-range ceiling
+      // (autoscaleInfoProvider keeps them out of the scale maths). The main line
+      // (raw OR smoothed) gets a whitespace gap at every OOR time so it breaks
+      // instead of plunging to a fake ~8190 mm.
       const ceiling = pts.length ? Math.max(...pts.map((p) => p.value)) : 0
-      oorData = oorTimes.map((time) => ({ time, value: ceiling }))
-      lineData = [...lineData, ...oorTimes.map((time) => ({ time }) as WhitespaceData)].sort(
+      const gapTimes: UTCTimestamp[] = []
+      let prevOor = false
+      for (const f of win) {
+        if (f.tof == null) continue
+        if (f.tofOor) {
+          if (!prevOor && oorData.length) oorData.push({ time: f.time } as WhitespaceData)
+          oorData.push({ time: f.time, value: ceiling })
+          gapTimes.push(f.time)
+          prevOor = true
+        } else {
+          prevOor = false
+        }
+      }
+      lineData = [...lineData, ...gapTimes.map((time) => ({ time }) as WhitespaceData)].sort(
         (x, y) => (x.time as number) - (y.time as number),
       )
     }
@@ -504,9 +530,10 @@ export function LiveChart({ nodeId, nodeName }: Props) {
     setShowBackToLive(false)
   }
 
-  const cards = SERIES_KEYS.filter((k) => available[k])
   const meta = SERIES_META[series]
   const legendColor = lineColorFor(readChartColors(), series, mode)
+  // chart is open on a series that has no samples yet -> show a waiting state
+  const chartWaiting = expanded && !available[series]
 
   return (
     <section className="card live-chart">
@@ -524,16 +551,30 @@ export function LiveChart({ nodeId, nodeName }: Props) {
       )}
 
       <div className="lc-toolbar">
-        <div className="seg" role="group" aria-label="value display mode">
-          <button className={mode === 'raw' ? 'on' : ''} onClick={() => setMode('raw')}>
-            Raw
-          </button>
-          <button
-            className={mode === 'smoothed' ? 'on alt' : ''}
-            onClick={() => setMode('smoothed')}
-          >
-            Smoothed
-          </button>
+        <div className="lc-toolbar-left">
+          <div className="seg" role="group" aria-label="value display mode">
+            <button className={mode === 'raw' ? 'on' : ''} onClick={() => setMode('raw')}>
+              Raw
+            </button>
+            <button
+              className={mode === 'smoothed' ? 'on alt' : ''}
+              onClick={() => setMode('smoothed')}
+            >
+              Smoothed
+            </button>
+          </div>
+          {available.tof && (
+            <button
+              type="button"
+              className={thrOpen ? 'btn thr-btn accent' : 'btn thr-btn'}
+              aria-expanded={thrOpen}
+              onClick={() => setThrOpen((o) => !o)}
+              title="ToF distance threshold alert"
+            >
+              <Icon d={I.sliders} />
+              Threshold
+            </button>
+          )}
         </div>
         <button className="btn" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
           <Icon d={expanded ? I.chevronUp : I.chevronDown} />
@@ -543,25 +584,34 @@ export function LiveChart({ nodeId, nodeName }: Props) {
 
       {/* compact readout -- also the chart's series selector: clicking a tile
           picks that series and expands the chart (there is no separate series
-          toggle). */}
+          toggle). All three tiles always render; one with no data yet shows
+          "--", is de-emphasised, and still selects its series when clicked. */}
       <div className="lc-stats">
-        {cards.length === 0 && <p className="muted small">no sensor values yet…</p>}
-        {cards.map((k) => {
+        {SERIES_KEYS.map((k) => {
           const oor = k === 'tof' && current.tofOor
+          const hasData = available[k]
           const sel = expanded && series === k
           const warn = k === 'tof' && tofAlert
+          const empty = !hasData && !oor
           const cls =
             'lc-stat lc-stat-btn' +
             (sel ? ' lc-stat-sel' : '') +
             (sel && mode === 'smoothed' ? ' alt' : '') +
-            (warn ? ' warn' : '')
+            (warn ? ' warn' : '') +
+            (empty && !sel ? ' lc-stat-empty' : '')
           return (
             <button
               type="button"
               className={cls}
               key={k}
               aria-pressed={sel}
-              title={oor ? `${SERIES_META[k].label} — out of range` : `Plot ${SERIES_META[k].label}`}
+              title={
+                oor
+                  ? `${SERIES_META[k].label} — out of range`
+                  : hasData
+                    ? `Plot ${SERIES_META[k].label}`
+                    : `No ${SERIES_META[k].label} data yet — click to watch for it`
+              }
               onClick={() => {
                 setSeries(k)
                 setExpanded(true)
@@ -569,29 +619,17 @@ export function LiveChart({ nodeId, nodeName }: Props) {
             >
               <span className="lc-stat-val">
                 {/* compact indicator in the value slot so its width never changes */}
-                {oor ? 'OOR' : fmtValue(k, current[k] as number)}
+                {oor ? 'OOR' : hasData ? fmtValue(k, current[k] as number) : '--'}
                 {!oor && <span className="lc-stat-unit"> {SERIES_META[k].unit}</span>}
               </span>
               <span className="lc-stat-label">
                 {oor
                   ? 'out of range'
-                  : `${SERIES_META[k].label}${mode === 'smoothed' ? ' · smoothed' : ''}`}
+                  : `${SERIES_META[k].label}${hasData && mode === 'smoothed' ? ' · smoothed' : ''}`}
               </span>
             </button>
           )
         })}
-        {available.tof && (
-          <button
-            type="button"
-            className={thrOpen ? 'btn thr-btn accent' : 'btn thr-btn'}
-            aria-expanded={thrOpen}
-            onClick={() => setThrOpen((o) => !o)}
-            title="ToF distance threshold alert"
-          >
-            <Icon d={I.sliders} />
-            Threshold
-          </button>
-        )}
       </div>
 
       {thrOpen && (
@@ -622,11 +660,9 @@ export function LiveChart({ nodeId, nodeName }: Props) {
       {expanded && (
         <>
           <div className="lc-toolbar">
-            <span className="muted small">
-              plotting{' '}
+            <span className="muted small lc-plot-cap" title="click a tile above to change">
               <strong style={{ color: 'var(--text)', fontWeight: 600 }}>{meta.label}</strong>
-              {mode === 'smoothed' && <span className="smoothed-note"> · smoothed</span>} — click a
-              tile above to change
+              {mode === 'smoothed' && <span className="smoothed-note"> · smoothed</span>}
             </span>
             <div className="seg num" role="group" aria-label="time range">
               {RANGES.map((r) => (
@@ -646,7 +682,14 @@ export function LiveChart({ nodeId, nodeName }: Props) {
             )}
           </div>
 
-          <div ref={containerRef} className="lc-canvas" />
+          <div className="lc-canvas-wrap">
+            <div ref={containerRef} className="lc-canvas" />
+            {chartWaiting && (
+              <div className="lc-canvas-wait">
+                <p className="muted small">waiting for {meta.label} data…</p>
+              </div>
+            )}
+          </div>
 
           <div className="lc-legend muted small">
             <span>
