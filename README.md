@@ -29,9 +29,12 @@ docs/       architecture + wire-protocol spec (source of truth) + handover/
   `10C4:EA60`, and publishes decoded frames onto an in-process event bus.
 - **Decoupled consumers.** `db/writer.py` and `ws/manager.py` each `subscribe()`
   to the bus independently; neither imports pyserial.
-- **Forensic + clean split.** `raw_frames` logs every candidate frame (CRC pass
-  or fail); `readings` holds only CRC-valid decoded values, with a unique
-  `(node_id, seq_num)` so re-ingestion is idempotent.
+- **Forensic + clean split.** `raw_frames` keeps only CRC-*failed* frames (a
+  tiny, permanent corruption log); recent CRC-valid frames live ~40 min in an
+  in-memory ring (`GET /debug/frames`), never on disk. `readings` holds CRC-valid
+  decoded values at full resolution for `READINGS_FULL_RES_HOURS` (default 7
+  days), then `db/retention.py` rolls them into 1-minute `readings_rollup`
+  buckets and deletes the originals. `GET /readings` merges both tiers.
 
 ## Run it
 
@@ -57,13 +60,15 @@ Environment overrides (all optional):
 | `NOVENTIS_DB_URL` | `sqlite+aiosqlite:///./noventis.db` | database |
 | `NOVENTIS_STALE_AFTER_S` | `10` | a node with no frame within this many seconds is `stale` |
 | `NOVENTIS_CORS_ORIGINS` | `http://localhost:5173` | comma-separated allowed origins |
+| `NOVENTIS_READINGS_FULL_RES_HOURS` | `168` | how far back full-resolution (2 Hz) readings stay queryable before they become 1-minute rollups; raise for longer fine-grained history at ~188 MB / node / 7 days |
+| `NOVENTIS_RAW_FRAME_BUFFER_SIZE` | `5000` | size of the in-memory recent-frames ring behind `GET /debug/frames` (~40 min at 2 Hz) |
 
 ### 2. Frontend
 
 ```
 cd frontend
 npm install
-npm run dev            # http://localhost:5173 — proxies /health /nodes /readings /raw-frames /live to :8000
+npm run dev            # http://localhost:5173 — proxies /health /nodes /readings /raw-frames /debug /live to :8000
 ```
 
 ### Protocol self-test (no dependencies)
@@ -95,6 +100,49 @@ and `"nodes_seen": 1`.
 If no adapter is plugged in, `/health` reports
 `"connected": false, "last_error": "no CP2102 adapter detected …"` and the reader
 rescans every 3 s — no crash.
+
+## Storage, retention & backups
+
+The entire dataset is a single SQLite file (`noventis.db` by default). Understand
+these three points before running in production:
+
+1. **Full-resolution readings are kept for `NOVENTIS_READINGS_FULL_RES_HOURS`
+   (default 168 h = 7 days), then rolled up and deleted.** `backend/db/retention.py`
+   runs hourly: readings older than that window are aggregated into 1-minute
+   per-node `readings_rollup` buckets (avg + min + max + count) and the original
+   ~0.5 s rows are **permanently removed**. `GET /readings` transparently serves
+   the rollup tier for older ranges. Raise `NOVENTIS_READINGS_FULL_RES_HOURS` to
+   keep fine-grained data longer — cost is linear, ≈188 MB per node per 7 days
+   at 2 Hz (see [docs/architecture.md](docs/architecture.md#full-resolution-window--storage)).
+
+2. **Take backups — at least daily — with the provided script, not `cp`.**
+
+   ```
+   python scripts/backup_db.py                 # -> ./backups/noventis-YYYYMMDD-HHMMSSZ.db
+   python scripts/backup_db.py --out-dir D:\noventis-backups
+   ```
+
+   It uses SQLite `VACUUM INTO` (a raw file copy of a live WAL-mode DB can be
+   torn/stale), is safe to run while the backend is up, and verifies the
+   snapshot (`quick_check` + row counts) before exiting 0. Schedule it via cron
+   or Windows Task Scheduler.
+
+   > ⚠️ **Fine-grained readings older than the full-res window cannot be
+   > reconstructed** once retention has rolled them up. If the raw 2 Hz data
+   > matters, a backup must be taken **within `NOVENTIS_READINGS_FULL_RES_HOURS`**
+   > of the data being recorded. Backups outside that window only ever contain
+   > the 1-minute rollups for the older period.
+
+3. **The backend never deletes data at startup.** A database created before the
+   raw-frame storage change still carries its old CRC-valid `raw_frames` rows;
+   clearing them (they are dead weight under the new model) is a deliberate,
+   prompted operator action, not boot behaviour:
+
+   ```
+   python scripts/migrate_purge_legacy_frames.py            # shows the count, asks to confirm
+   python scripts/migrate_purge_legacy_frames.py --dry-run  # count only
+   python scripts/migrate_purge_legacy_frames.py --yes      # non-interactive
+   ```
 
 ## Handover
 
