@@ -290,6 +290,7 @@ class ArchiveWriter:
     def start(self) -> None:
         self._spool_dir.mkdir(parents=True, exist_ok=True)
         self._recover_orphans()
+        self._recover_last_seq()
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(
                 target=self._thread_main, name="archive-writer", daemon=True
@@ -493,16 +494,15 @@ class ArchiveWriter:
         clear `complete`: nothing the backend can do would have caught a frame
         that never arrived (protocol-spec section 6).
 
-        KNOWN BLIND SPOT: ``self._last_seq`` is instance state, so it -- and
-        therefore this count -- does NOT span a restart. A gap that happens to
-        fall exactly on a restart boundary (the node kept transmitting while the
-        backend was down) goes uncounted here, even though the manifest's
-        ``multi_part: true`` on that hour is a visible sign one occurred. Verified
-        live 2026-09-04: a two-restart session left a genuine 5-frame gap at the
-        part-0000/part-0001 seam that this counter missed, while it correctly
-        caught an unrelated 1-frame mid-session gap. Does not affect `complete`
-        either way -- both kinds are already outside what the backend could have
-        observed -- so this is a diagnostics-accuracy gap, not a durability one.
+        SPANS RESTARTS: ``self._last_seq`` is seeded at startup by
+        ``_recover_last_seq`` from the most recently sealed manifest, so a gap
+        landing exactly on a restart boundary is still counted here, not just a
+        gap within one continuous run. Found live 2026-09-04, before that seeding
+        existed: a two-restart session left a genuine 5-frame gap at the
+        part-0000/part-0001 seam that went uncounted because a fresh process has
+        no memory of the last row the previous one wrote. Either way this never
+        affects `complete` -- a restart-boundary gap is already outside what the
+        backend could have observed, same as ordinary RF loss.
         """
         gaps = 0
         for row in rows:
@@ -603,6 +603,14 @@ class ArchiveWriter:
                 "complete": part_complete,
                 "bytes_gz": gz.stat().st_size,
                 "sha256": sha256_file(gz),
+                # Last seq_num this part wrote for this node, restored into
+                # self._last_seq at the next startup (see _recover_last_seq) so
+                # gap detection spans a restart instead of resetting to unknown.
+                # Fixes a found-live blind spot: a genuine 5-frame gap that fell
+                # exactly on a restart boundary went uncounted because
+                # self._last_seq is in-memory state that a fresh process starts
+                # without (verified 2026-09-04 against the real node).
+                "last_seq": self._last_seq.get(node_id),
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             })
 
@@ -664,6 +672,49 @@ class ArchiveWriter:
             except Exception:
                 self._errors += 1
                 log.exception("archive: could not recover orphaned spool %s", path)
+
+    def _recover_last_seq(self) -> None:
+        """Seed ``self._last_seq`` from the most recently sealed manifest per
+        node, so gap detection spans a restart instead of starting blind.
+
+        Without this, a restart resets ``self._last_seq`` to empty, and the
+        gap between the last row before shutdown and the first row after it goes
+        uncounted -- found live 2026-09-04: a two-restart session left a genuine
+        5-frame gap exactly on a restart boundary that seq_gaps_observed missed.
+        This does not change ``complete`` semantics (that gap was already outside
+        what the backend could observe either way); it only makes the informational
+        counter, and the ``last_seq`` this method restores, honest about it.
+
+        LOCAL-DISK ONLY, by necessity: ``ArchiveStore`` deliberately offers no
+        ``list()`` (see ``_compact``'s docstring on part numbering), and finding
+        "the newest manifest across every hour for this node" needs either a
+        listing or an index this project does not have yet. A future non-local
+        store needs a small index (e.g. one `_last_seq.json` per node, written
+        alongside each manifest) to keep this working without a directory scan.
+        """
+        data_dir = self._dir / "data"
+        if not data_dir.is_dir():
+            return
+        newest: dict[int, tuple[str, int]] = {}   # node_id -> (closed_at, seq)
+        for mpath in data_dir.rglob("_manifest.json"):
+            try:
+                m = json.loads(mpath.read_text(encoding="utf-8"))
+                parts = m.get("parts")
+                if not parts:
+                    continue                       # schema 1, or an empty hour
+                last_seq = parts[-1].get("last_seq")
+                if last_seq is None:
+                    continue
+                node_id = m["node_id"]
+                closed_at = m.get("closed_at", "")
+                if node_id not in newest or closed_at > newest[node_id][0]:
+                    newest[node_id] = (closed_at, last_seq)
+            except Exception:
+                log.warning("archive: could not read %s while recovering last_seq", mpath)
+        for node_id, (closed_at, seq) in newest.items():
+            self._last_seq[node_id] = seq
+            log.info("archive: restored last_seq=%d for node %s from %s",
+                     seq, node_id, closed_at)
 
     # -- introspection (GET /health) ------------------------------------- #
     def status(self) -> dict:
