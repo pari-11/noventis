@@ -1,11 +1,15 @@
 """
 backend/api/raw_frames.py -- REST: GET /raw-frames?node_id=&crc_ok=&limit=
 
-Forensic access to the raw_frames log -- every candidate frame received, CRC
-pass or fail. Primarily for debugging CRC failures.
+Forensic access to the raw_frames table. Under the current storage model this
+table holds **CRC-failed frames only** -- corrupt frames are rare and kept
+indefinitely for spotting corruption patterns over time. CRC-valid frames are
+not persisted; the most recent ones live in the in-memory ring buffer, reachable
+via GET /debug/frames. (Rows from before the model change may still be CRC-ok
+until db/retention.py's one-time purge runs.)
 
   node_id  (optional)  int   -- omit to include frames with an unparseable header (node_id NULL)
-  crc_ok   (optional)  bool  -- e.g. ?crc_ok=false to see only corrupt frames
+  crc_ok   (optional)  bool  -- kept for compatibility; effectively always false now
   limit    (optional)  1..2000, default 200
 """
 

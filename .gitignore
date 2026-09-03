@@ -9,6 +9,9 @@ venv/
 *.db-wal
 *.db-shm
 
+# Local DB snapshots from scripts/backup_db.py
+backups/
+
 # Node / Vite
 node_modules/
 dist/
@@ -21,3 +24,14 @@ dist/
 
 # Handover PDF is added out of band
 docs/handover/*.pdf
+
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+
+# Archive tier DATA (system of record; back this up, do not commit it).
+# Leading slash anchors to the repo root -- a bare `archive/` also matches
+# backend/archive/, which is SOURCE and must be committed.
+/archive/

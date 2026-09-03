@@ -5,7 +5,13 @@ Subscribes to the event bus independently of ws.manager. Never imports pyserial.
 Started/stopped as an asyncio task by main.py's lifespan (after init_db()).
 
 Per event (see serial_reader.SerialReader._handle_frame for the shape):
-  1. INSERT into raw_frames                    -- ALWAYS (forensic log, CRC pass or fail)
+  1. INSERT into raw_frames                    -- ONLY when NOT crc_ok. CRC-valid
+                                                  frames are no longer persisted:
+                                                  they live for ~40 min in the
+                                                  in-memory ring buffer
+                                                  (ingest/frame_buffer.py) and
+                                                  nowhere on disk. CRC failures
+                                                  are rare and kept indefinitely.
   2. UPSERT nodes.last_seen = received_at      -- for every frame that carries a node_id
   3. INSERT into readings                      -- ONLY when crc_ok, and
      ON CONFLICT (node_id, seq_num) DO NOTHING -- so replaying a capture / restarting
@@ -22,9 +28,11 @@ new session ingests. `raw_frames` (the forensic log) is never touched.
 One transaction per event (the node rate is ~2 Hz -- batching is a later concern).
 A failure on one event is logged and skipped; it never kills the loop.
 
+`readings` retention/rollup lives in db/retention.py; `raw_frames` needs none
+now that only CRC failures land there.
+
 TODO:
   - [ ] Batch commits (N rows / 100 ms) if ingestion volume ever grows.
-  - [ ] Prune/rollup raw_frames.
 """
 
 from __future__ import annotations
@@ -55,17 +63,56 @@ RESTART_WRAP_BAND = SEQ_SPACE - RESTART_BACKSTEP_MIN
 RESTART_SILENCE_S = 2.0
 
 
+def _backstep(prev_seq: int, seq: int) -> int:
+    """How far ``seq`` moved backward from ``prev_seq``. Negative = forward."""
+    return prev_seq - seq
+
+
 def _looks_like_restart(
     prev_seq: int | None, prev_ts: datetime | None, seq: int, now: datetime
 ) -> bool:
+    """A node reboot: ``seq_num`` resets near 0 from an arbitrary point, after
+    the node has gone quiet. Deliberately excludes the legitimate end-of-space
+    wrap (``_looks_like_wrap``, below) -- that is a routine event mid-session,
+    not a restart, and must not be counted or logged as one.
+    """
     if prev_seq is None:
         return False
-    backstep = prev_seq - seq
+    backstep = _backstep(prev_seq, seq)
     if backstep < RESTART_BACKSTEP_MIN or backstep > RESTART_WRAP_BAND:
         return False
     if prev_ts is not None and (now - prev_ts).total_seconds() < RESTART_SILENCE_S:
         return False
     return True
+
+
+def _looks_like_wrap(prev_seq: int | None, seq: int) -> bool:
+    """The legitimate ``0xFFFF -> 0x0000`` rollover, mid-session.
+
+    ``seq_num`` is uint16, so at ~2 Hz it wraps roughly every 9.1 h of
+    continuous uptime -- inside ``READINGS_FULL_RES_HOURS``' default 168 h
+    window. Without clearing on this event, the very first reading after a
+    wrap collides with the still-resident row from ~9 h earlier on the
+    ``(node_id, seq_num)`` unique constraint; ``ON CONFLICT DO NOTHING``
+    silently discards it, and then EVERY reading after that too, forever --
+    nothing ever frees that seq_num again within the window. `readings`
+    ingestion for that node would freeze permanently, invisibly (only
+    ``readings_duplicate`` climbing, uncapped and unalarmed, in `/health`).
+
+    The live `/live` feed and the archive tier are unaffected either way --
+    neither dedupes on `seq_num` -- so nothing is actually lost; only the
+    SQLite-backed History view would silently stop advancing. This is a
+    structural ceiling on `readings`, not a bug to route around: a single
+    node's full-resolution capacity there is bounded by `seq_num`'s ~9.1 h
+    range regardless of `READINGS_FULL_RES_HOURS`. The archive is where full
+    resolution actually lives past that.
+
+    No silence check, unlike a restart: a wrap happens mid-stream during
+    perfectly healthy, continuous operation, not after a gap.
+    """
+    if prev_seq is None:
+        return False
+    return _backstep(prev_seq, seq) > RESTART_WRAP_BAND
 
 
 class DBWriter:
@@ -77,6 +124,7 @@ class DBWriter:
         self._readings_written = 0
         self._readings_duplicate = 0
         self._sessions_reset = 0
+        self._wraps_handled = 0
         self._errors = 0
         # per-node: last seq_num and receipt time of a reading-bearing frame
         self._last_seq: dict[int, int] = {}
@@ -104,13 +152,14 @@ class DBWriter:
             "readings_written": self._readings_written,
             "readings_duplicate": self._readings_duplicate,
             "sessions_reset": self._sessions_reset,
+            "wraps_handled": self._wraps_handled,
             "errors": self._errors,
         }
 
     # -- loop ---------------------------------------------------------- #
     async def _run(self) -> None:
         log.info("db writer subscribed to event bus")
-        async for event in self._bus.subscribe():
+        async for event in self._bus.subscribe("db-writer"):
             try:
                 await self._persist(event)
             except Exception:
@@ -125,15 +174,20 @@ class DBWriter:
         received_at = event["received_at"]
         seq = event["seq_num"]
 
+        crc_ok = event["crc_ok"]
+
         async with self._session_factory() as session:
             async with session.begin():
-                # 1. forensic log -- always
-                session.add(RawFrame(
-                    node_id=node_id,
-                    received_at=received_at,
-                    crc_ok=event["crc_ok"],
-                    raw=event["raw"],
-                ))
+                # 1. forensic log -- CRC failures only. CRC-valid frames are kept
+                #    transiently in the in-memory ring buffer instead (see
+                #    ingest/frame_buffer.py), never written to disk.
+                if not crc_ok:
+                    session.add(RawFrame(
+                        node_id=node_id,
+                        received_at=received_at,
+                        crc_ok=False,
+                        raw=event["raw"],
+                    ))
 
                 if node_id is not None:
                     # 2. node liveness -- upsert last_seen on every framed packet
@@ -150,7 +204,7 @@ class DBWriter:
                 #    decoded values; idempotent on (node_id, seq_num). Empty-payload
                 #    keepalive frames update last_seen (above) but are not readings.
                 values = event["values"]
-                store_reading = event["crc_ok"] and node_id is not None and bool(values)
+                store_reading = crc_ok and node_id is not None and bool(values)
                 inserted_reading = False
                 if store_reading:
                     prev_seq = self._last_seq.get(node_id)
@@ -176,6 +230,22 @@ class DBWriter:
                             "is untouched",
                             node_id, prev_seq, seq,
                         )
+                    elif _looks_like_wrap(prev_seq, seq):
+                        # Routine, not a fault -- see _looks_like_wrap's docstring
+                        # for why this must clear too, not just skip. INFO, not
+                        # WARNING: this is expected to happen roughly every 9 h of
+                        # continuous uptime, unlike an actual restart.
+                        await session.execute(
+                            delete(Reading).where(Reading.node_id == node_id)
+                        )
+                        self._wraps_handled += 1
+                        log.info(
+                            "node %s seq wrapped (last %s -> now %s, routine "
+                            "0xFFFF->0x0000 rollover, not a restart); cleared its "
+                            "prior readings so the new lap can ingest -- archive/ "
+                            "and /live are unaffected, nothing is actually lost",
+                            node_id, prev_seq, seq,
+                        )
 
                     ax, ay, az = values.get("accel_mss") or _NONE3
                     gx, gy, gz = values.get("gyro_rads") or _NONE3
@@ -195,7 +265,8 @@ class DBWriter:
                     inserted_reading = bool(result.rowcount)
 
         # state + counters updated after the transaction commits cleanly
-        self._raw_written += 1
+        if not crc_ok:
+            self._raw_written += 1  # raw_frames now holds CRC failures only
         if store_reading:
             self._last_seq[node_id] = seq
             self._last_seen_ts[node_id] = received_at

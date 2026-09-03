@@ -68,6 +68,11 @@ def _retrofit_columns(conn) -> None:
             "WHERE tof_mm IS NOT NULL"
         ))
 
+    node_cols = {c["name"] for c in inspect(conn).get_columns("nodes")}
+    if "name" not in node_cols:
+        # Nullable, no back-fill: a NULL name renders as "Node {id}" on read.
+        conn.execute(text("ALTER TABLE nodes ADD COLUMN name VARCHAR(64)"))
+
 
 async def init_db(target: AsyncEngine | None = None) -> None:
     """Create tables if they do not exist. Called from main.py's lifespan."""

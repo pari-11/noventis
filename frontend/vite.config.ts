@@ -16,9 +16,11 @@ export default defineConfig({
     proxy: {
       '/health': BACKEND,
       '/session': BACKEND,
+      '/rescan': BACKEND,
       '/nodes': BACKEND,
       '/readings': BACKEND,
       '/raw-frames': BACKEND,
+      '/debug': BACKEND,
       '/live': { target: WS_BACKEND, ws: true },
     },
   },

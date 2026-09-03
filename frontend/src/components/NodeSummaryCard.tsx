@@ -3,8 +3,9 @@
  *
  * Numbers only, no chart: live/stale badge (from GET /nodes' computed `stale`),
  * latest ToF + how long ago it landed, last seq_num, ok/total CRC ratio over the
- * last 500 raw frames, and last-seen time. The whole card is a button: clicking
- * it selects that node (same as NodeSelector).
+ * last 500 frames (from GET /debug/frames -- the in-memory ring buffer that
+ * replaced the raw_frames table for CRC-valid frames), and last-seen time. The
+ * whole card is a button: clicking it selects that node (same as NodeSelector).
  */
 
 import { useEffect, useState } from 'react'
@@ -21,6 +22,18 @@ type Props = {
 
 const RAW_WINDOW = 500
 
+const mag = (x: number | null, y: number | null, z: number | null): number | null =>
+  x == null || y == null || z == null ? null : Math.sqrt(x * x + y * y + z * z)
+
+/** Coarse "time since" label: 42s ago / 7m ago / 19h ago / 3d ago. */
+const ago = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.round(s / 60)}m ago`
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+
 export function NodeSummaryCard({ node, now, onSelect }: Props) {
   const id = node.node_id
   const [latest, setLatest] = useState<Reading | null>(null)
@@ -32,7 +45,7 @@ export function NodeSummaryCard({ node, now, onSelect }: Props) {
       try {
         const [rRes, fRes] = await Promise.all([
           fetch(`/readings?node_id=${id}&limit=1`),
-          fetch(`/raw-frames?node_id=${id}&limit=${RAW_WINDOW}`),
+          fetch(`/debug/frames?node_id=${id}&limit=${RAW_WINDOW}`),
         ])
         if (alive && rRes.ok) {
           const rows = (await rRes.json()) as Reading[]
@@ -56,28 +69,43 @@ export function NodeSummaryCard({ node, now, onSelect }: Props) {
   }, [id])
 
   const agoMs = latest ? now - Date.parse(latest.timestamp) : null
-  const agoLabel = agoMs == null ? null : `${Math.max(0, Math.round(agoMs / 1000))}s ago`
+  const agoLabel = agoMs == null ? null : ago(agoMs)
+  const accelMag = latest ? mag(latest.accel_x, latest.accel_y, latest.accel_z) : null
+  const gyroMag = latest ? mag(latest.gyro_x, latest.gyro_y, latest.gyro_z) : null
+  // until the node is actually being heard from (not stale), the last stored
+  // reading is history, not a live value -- show a placeholder instead.
+  const detected = !node.stale
 
   return (
     <button className="summary-card card" onClick={() => onSelect(id)}>
       <div className="sc-top">
-        <span className="sc-id">Node {id}</span>
-        <span className={node.stale ? 'sc-badge' : 'sc-badge live'}>
-          <span className={node.stale ? 'dot stale' : 'dot live'} />
-          {node.stale ? 'stale' : 'live'}
-        </span>
+        <span className="sc-id">{node.name}</span>
+        <span className={node.stale ? 'pill' : 'pill up'}>{node.stale ? 'Offline' : 'Online'}</span>
       </div>
 
       <div className="sc-tof">
-        {latest?.tof_out_of_range ? (
+        {!detected ? (
+          <span className="sc-tof-val sc-tof-oor">--</span>
+        ) : latest?.tof_out_of_range ? (
           <span className="sc-tof-val sc-tof-oor">out of range</span>
         ) : (
           <>
-            <span className="sc-tof-val">{latest?.tof_mm ?? '·'}</span>
-            <span className="sc-unit">mm</span>
+            <span className="sc-tof-val">{latest?.tof_mm ?? '--'}</span>
+            <span className="sc-unit">mm TOF</span>
           </>
         )}
-        {agoLabel && <span className="muted small sc-ago">{agoLabel}</span>}
+        {agoLabel && <span className="muted small sc-ago mono">{agoLabel}</span>}
+      </div>
+
+      <div className="sc-sensors mono small">
+        <span>
+          <span className="muted">|accel|</span> {accelMag == null ? '·' : accelMag.toFixed(2)}{' '}
+          <span className="muted">m/s²</span>
+        </span>
+        <span>
+          <span className="muted">|gyro|</span> {gyroMag == null ? '·' : gyroMag.toFixed(3)}{' '}
+          <span className="muted">rad/s</span>
+        </span>
       </div>
 
       <dl className="sc-meta">
@@ -89,11 +117,9 @@ export function NodeSummaryCard({ node, now, onSelect }: Props) {
           <dt>frames ok</dt>
           <dd>{frames ? `${frames.ok}/${frames.total}` : '·'}</dd>
         </div>
-        <div>
-          <dt>last seen</dt>
-          <dd>{new Date(node.last_seen).toLocaleTimeString()}</dd>
-        </div>
       </dl>
+
+      <span className="muted small mono">last seen {new Date(node.last_seen).toLocaleTimeString()}</span>
     </button>
   )
 }

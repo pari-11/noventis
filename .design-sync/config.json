@@ -1,0 +1,17 @@
+{
+  "projectId": "01336fca-3749-4eda-9b9e-dcbba7142d1e",
+  "pkg": "noventis-frontend",
+  "globalName": "NoventisFrontend",
+  "shape": "package",
+  "srcDir": "src",
+  "cssEntry": "src/index.css",
+  "componentSrcMap": {
+    "App": null,
+    "NodeSelector": null,
+    "LiveChart": null,
+    "HistoryPanel": null,
+    "NodeSummaryCard": null
+  },
+  "readmeHeader": ".design-sync/conventions.md",
+  "entry": "frontend/src/_ds-bundle-entry.ts"
+}

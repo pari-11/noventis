@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 import serial
@@ -170,6 +171,9 @@ class SerialReader:
         self._port_override = port_override or os.getenv("NOVENTIS_SERIAL_PORT") or None
 
         self._stop = threading.Event()
+        # set by request_rescan() to make the thread drop any open port and
+        # re-run autodetection immediately instead of waiting out RESCAN_INTERVAL_S
+        self._rescan = threading.Event()
         self._thread: threading.Thread | None = None
         self._port: str | None = None          # open device path, or None when disconnected
         self._bytes_read = 0
@@ -188,10 +192,28 @@ class SerialReader:
 
     def stop(self, timeout=2.0):
         self._stop.set()
+        self._rescan.set()  # break any interruptible wait promptly
         if self._thread:
             self._thread.join(timeout=timeout)
             self._thread = None
         log.info("serial reader thread stopped")
+
+    def request_rescan(self):
+        """Drop any open port and re-run CP2102 autodetection now.
+
+        Safe to call from any thread (e.g. a FastAPI request handler). The
+        background thread picks it up within a read timeout (~0.2 s); it does not
+        block the caller.
+        """
+        log.info("serial reader: rescan requested")
+        self._rescan.set()
+
+    def _sleep(self, seconds: float):
+        """Wait up to ``seconds``, returning early on stop or a rescan request."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self._stop.wait(0.1) or self._rescan.is_set():
+                return
 
     # -- status (for GET /health) ---------------------------------------- #
     @property
@@ -212,12 +234,13 @@ class SerialReader:
     # -- thread body ------------------------------------------------------- #
     def _run(self):
         while not self._stop.is_set():
+            self._rescan.clear()  # consume any pending request; act on it now
             try:
                 device = select_port(self._node_port_map, self._port_override)
             except (NoAdapterFound, AmbiguousAdapters) as exc:
                 self._last_error = str(exc)
                 log.warning("%s", exc)
-                self._stop.wait(RESCAN_INTERVAL_S)
+                self._sleep(RESCAN_INTERVAL_S)
                 continue
 
             try:
@@ -231,7 +254,7 @@ class SerialReader:
                               RESCAN_INTERVAL_S)
             finally:
                 self._port = None
-            self._stop.wait(RESCAN_INTERVAL_S)
+            self._sleep(RESCAN_INTERVAL_S)
 
     def _read_from(self, device):
         log.info("opening LoRa serial port %s @ %d baud (8N1)", device, self._baud)
@@ -250,7 +273,7 @@ class SerialReader:
 
             buf = bytearray()
             idle_ticks = 0
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._rescan.is_set():
                 waiting = ser.in_waiting
                 chunk = ser.read(waiting or 1)  # returns within READ_TIMEOUT_S when idle
                 if not chunk:
