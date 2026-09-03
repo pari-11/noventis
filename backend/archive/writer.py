@@ -492,6 +492,17 @@ class ArchiveWriter:
         Recorded in the manifest so a reader can see it, but deliberately does NOT
         clear `complete`: nothing the backend can do would have caught a frame
         that never arrived (protocol-spec section 6).
+
+        KNOWN BLIND SPOT: ``self._last_seq`` is instance state, so it -- and
+        therefore this count -- does NOT span a restart. A gap that happens to
+        fall exactly on a restart boundary (the node kept transmitting while the
+        backend was down) goes uncounted here, even though the manifest's
+        ``multi_part: true`` on that hour is a visible sign one occurred. Verified
+        live 2026-09-04: a two-restart session left a genuine 5-frame gap at the
+        part-0000/part-0001 seam that this counter missed, while it correctly
+        caught an unrelated 1-frame mid-session gap. Does not affect `complete`
+        either way -- both kinds are already outside what the backend could have
+        observed -- so this is a diagnostics-accuracy gap, not a durability one.
         """
         gaps = 0
         for row in rows:
