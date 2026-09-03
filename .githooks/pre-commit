@@ -1,0 +1,38 @@
+#!/bin/sh
+# .githooks/pre-commit -- enforce CLAUDE.md constraint #2.
+#
+# edge/protocol.py and backend/ingest/protocol.py must stay byte-for-byte
+# identical. Nothing else in the project checks this, and drift fails late and
+# misleadingly (the node transmits fine; the backend rejects every frame as
+# corrupt, so it looks like a radio fault).
+#
+# Install once per clone:   git config core.hooksPath .githooks
+# Repair drift:             python scripts/sync_protocol.py
+#
+# Runs on every commit, not just commits that touch those files: a stale mirror
+# left behind by an earlier --no-verify or a bad merge should still be caught.
+
+set -e
+
+# Prefer the project venv, fall back to whatever python is on PATH.
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"          # Windows
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"                  # POSIX
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+else
+    echo "pre-commit: no python found; skipping protocol sync check." >&2
+    exit 0
+fi
+
+"$PY" scripts/check_protocol_sync.py --quiet || {
+    echo "" >&2
+    echo "Commit refused. Fix the drift, then commit again." >&2
+    echo "(To bypass deliberately: git commit --no-verify)" >&2
+    exit 1
+}
+
+exit 0

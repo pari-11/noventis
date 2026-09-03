@@ -77,6 +77,30 @@ npm run dev            # http://localhost:5173 — proxies /health /nodes /readi
 python edge/protocol.py
 ```
 
+### Keeping the two protocol modules in sync
+
+`edge/protocol.py` and `backend/ingest/protocol.py` must stay **byte-for-byte
+identical** (the project's single point of failure). Drift fails late and
+misleadingly: the node keeps transmitting, the backend rejects every frame as
+corrupt, and it presents as a radio fault rather than a code change.
+
+A pre-commit hook refuses any commit that drifts them. **Install it once per
+clone:**
+
+```
+git config core.hooksPath .githooks
+```
+
+```
+python scripts/check_protocol_sync.py    # verify (exit 1 if drifted)
+python scripts/sync_protocol.py          # repair: edge/ is the master copy
+python scripts/sync_protocol.py --reverse   # if you edited the backend mirror
+```
+
+`edge/protocol.py` is the master copy — it is what ships to the hardware. The
+check only enforces that the files match; a wire-format change must also update
+[docs/protocol-spec.md](docs/protocol-spec.md) in the same commit.
+
 ## What you should see when a remote node powers on
 
 **Base station console** (uvicorn):
