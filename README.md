@@ -67,7 +67,7 @@ Environment overrides (all optional):
 | `NOVENTIS_DB_URL` | `sqlite+aiosqlite:///./noventis.db` | database |
 | `NOVENTIS_STALE_AFTER_S` | `10` | a node with no frame within this many seconds is `stale` |
 | `NOVENTIS_CORS_ORIGINS` | `http://localhost:5173` | comma-separated allowed origins |
-| `NOVENTIS_READINGS_FULL_RES_HOURS` | `168` | how far back full-resolution (2 Hz) readings stay queryable through the API before they become 1-minute rollups; raise for longer queryable history at ~188 MB / node / 7 days. Not the same as durability -- see "Storage, retention & backups" |
+| `NOVENTIS_READINGS_FULL_RES_HOURS` | `168` | how far back full-resolution (2 Hz) readings stay queryable through the API before they become 1-minute rollups; raise for longer queryable history at ~188 MB / node / 7 days. **Real per-node ceiling is `min(this, ~9.1 h)`** -- `seq_num`'s uint16 wrap. Not the same as durability -- see "Storage, retention & backups" |
 | `NOVENTIS_RAW_FRAME_BUFFER_SIZE` | `5000` | size of the in-memory recent-frames ring behind `GET /debug/frames` (~40 min at 2 Hz) |
 | `NOVENTIS_MAX_WS_CONNECTIONS` | `32` | `/live` connections beyond this are refused (close code 1013) |
 | `NOVENTIS_WS_CLIENT_QUEUE_MAX` | `256` | per-connection outbox depth; a client that falls behind drops only its own oldest messages |
@@ -147,13 +147,18 @@ and `archive/` (append-only, unbounded, the system of record). Understand these
 four points before running in production:
 
 1. **Full-resolution readings are kept *queryable* for `NOVENTIS_READINGS_FULL_RES_HOURS`
-   (default 168 h = 7 days), then rolled up.** `backend/db/retention.py` runs
-   hourly: readings older than that window are aggregated into 1-minute per-node
-   `readings_rollup` buckets (avg + min + max + count) and the original ~0.5 s
-   rows are removed **from SQLite**. `GET /readings` transparently serves the
-   rollup tier for older ranges. Raise `NOVENTIS_READINGS_FULL_RES_HOURS` to keep
-   more fine-grained data *queryable* — cost is linear, ≈188 MB per node per 7
-   days at 2 Hz (see [docs/architecture.md](docs/architecture.md#full-resolution-window--storage)).
+   (default 168 h = 7 days), then rolled up — but the real per-node ceiling is
+   `min(that, ~9.1 h)`.** `seq_num` is uint16 and wraps every ~9.1 h at 2 Hz;
+   `db/writer.py` clears a node's `readings` on that wrap (same as it does on a
+   reboot) so ingestion never freezes — but it also means one continuously-running
+   node can't exceed ~9.1 h of full-res data in SQLite, no matter how high the
+   knob is set. `archive/` (point 2) is unaffected and is where longer
+   full-resolution history actually lives. `backend/db/retention.py` still runs
+   hourly for whatever *is* within the window: older readings are aggregated into
+   1-minute per-node `readings_rollup` buckets (avg + min + max + count) and the
+   original ~0.5 s rows are removed **from SQLite**; `GET /readings` transparently
+   serves the rollup tier for older ranges (see
+   [docs/architecture.md](docs/architecture.md#full-resolution-window--storage)).
 
 2. **The archive tier keeps every reading, forever, regardless of that window.**
    `backend/archive/writer.py` independently appends every CRC-valid reading to

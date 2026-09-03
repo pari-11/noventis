@@ -173,7 +173,7 @@ along with a cloud `ArchiveStore` implementation.
 |--------------|--------------------------------|--------------------------------------------------------------|-------------|
 | `nodes`      | known nodes                    | `node_id` PK, `last_seen`, `name` (nullable)                  | `stale` bool computed on read, never stored; `name` falls back to `"Node {id}"` on read when NULL |
 | `raw_frames` | forensic log of **CRC-failed** frames only | `id` PK, `node_id` (nullable), `received_at`, `crc_ok`, `raw` | index on `received_at`, `node_id`; grows negligibly (~12/24k), left unpruned |
-| `readings`   | CRC-valid decoded values, full-res, last `READINGS_FULL_RES_HOURS` | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `tof_out_of_range` (derived), `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
+| `readings`   | CRC-valid decoded values, full-res, last `min(READINGS_FULL_RES_HOURS, ~9.1 h)` per node (see below) | `id` PK, `node_id`, `seq_num`, `timestamp`, `tof_mm`, `tof_out_of_range` (derived), `accel_{x,y,z}` (m/s^2), `gyro_{x,y,z}` (rad/s) | index `(node_id, timestamp)`; **unique `(node_id, seq_num)`** |
 | `readings_rollup` | per-node time-bucket aggregates of `readings` older than that window | `id` PK, `node_id`, `bucket_start`, `sample_count`, `tof_mm_{avg,min,max}`, `accel_{x,y,z}_{avg,min,max}`, `gyro_{x,y,z}_{avg,min,max}` | index + **unique `(node_id, bucket_start)`** |
 
 CRC-valid frames are **not** persisted -- the most recent ~5000 live in
@@ -195,7 +195,17 @@ DB to incremental mode).
 (2 Hz) data stays *queryable* in `readings` before it is collapsed to 1-minute
 avg/min/max rows and the originals are **permanently deleted from SQLite** (see
 "Archive tier" above -- they are not gone from `archive/`, just no longer
-queryable through the API). Cost is linear:
+queryable through the API).
+
+**The real ceiling per node is `min(READINGS_FULL_RES_HOURS, ~9.1 h)`**, not the
+raw value of the knob: `seq_num` is uint16 and wraps every ~9.1 h at 2 Hz, and
+`db/writer.py` clears a node's `readings` on that wrap (same as a reboot) so
+ingestion never freezes on the resulting `(node_id, seq_num)` collision -- see
+the data model's `readings` entry. The table below is still the right figure
+for capacity planning (multiple nodes with staggered wrap/reboot cycles can
+approach it, and it's the honest upper bound if that per-node cap is ever
+lifted), just not what one continuously-running node reaches on its own. Cost
+is linear:
 
 | | rows | on disk (measured ~156 B/row incl. both indexes) |
 |---|--:|--:|
@@ -226,10 +236,25 @@ readings are dropped with `ON CONFLICT DO NOTHING`.
 
 A **node reboot** resets its `seq_num` to ~0, which would otherwise collide with
 the prior session and freeze that node's readings. `db/writer.py` watches each
-node's `seq_num`: a large backward jump (not the `0xFFFF -> 0x0000` wrap) after a
-gap of silence is a restart, and it clears that node's `readings` so the new
-session ingests. `writer.status().sessions_reset` counts how often it has fired.
-(It does not touch `readings_rollup`; historical buckets survive a reset.)
+node's `seq_num`: a large backward jump after a gap of silence is a restart, and
+it clears that node's `readings` so the new session ingests.
+`writer.status().sessions_reset` counts how often it has fired.
+
+The **`0xFFFF -> 0x0000` wrap** -- deliberately excluded from the restart check
+above, since it is a routine event, not a reboot -- gets the same clearing
+treatment via a separate check, `_looks_like_wrap`. `seq_num` is uint16, so at
+2 Hz it wraps every ~9.1 h of continuous uptime, well inside
+`READINGS_FULL_RES_HOURS`' default 168 h. Without clearing on it too, the first
+reading after a wrap collides with the still-resident row from ~9 h earlier, and
+`ON CONFLICT DO NOTHING` silently discards it -- and every reading after that,
+permanently, since nothing frees that `seq_num` again within the window.
+**The real per-node ceiling on `readings` is therefore
+`min(READINGS_FULL_RES_HOURS, ~9.1 h)`, not the raw value of the knob** --
+`archive/` is unaffected (it does not dedupe on `seq_num`) and is where longer
+full-resolution history actually lives. `writer.status().wraps_handled` counts
+wrap-triggered clears separately from `sessions_reset`, since one is routine and
+the other is not. (Neither touches `readings_rollup`; historical buckets survive
+either kind of clear.)
 
 Node liveness is derived on read, never stored: `GET /nodes` returns a boolean
 `stale`, true when `now - last_seen` exceeds `NOVENTIS_STALE_AFTER_S`

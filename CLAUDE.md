@@ -113,10 +113,21 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
      rollups -- linear storage cost, ~156 B/row, ~188 MB per node per 7 days at
      2 Hz); index `(node_id, timestamp)`;
      **unique `(node_id, seq_num)`** for idempotent re-ingestion *within a
-     session*. A node reboot resets `seq_num` to ~0 and would collide with the
-     prior session (readings freeze); `db/writer.py` detects the backward-jump +
-     silence and clears that node's prior `readings` so the new session ingests
-     (`raw_frames`/`readings_rollup` untouched; `status().sessions_reset` counts it).
+     session*. `seq_num` is uint16, so it wraps every ~9.1 h at 2 Hz -- **the real
+     ceiling on one node's full-res history here is `min(READINGS_FULL_RES_HOURS,
+     ~9.1 h)`**, not the raw value of the knob; a continuously-running node
+     cannot exceed the wrap period regardless of how high `READINGS_FULL_RES_HOURS`
+     is set. This is a property of `readings` specifically -- the archive tier
+     (constraint #8) is unaffected (it does not dedupe on `seq_num`) and is where
+     genuinely longer full-resolution history lives. A node reboot resets
+     `seq_num` to ~0 and would collide with the prior session; a genuine
+     end-of-space wrap does too, ~9.1 h into any continuous run. `db/writer.py`
+     detects both (the backward-jump + silence for a reboot,
+     `_looks_like_wrap` for the routine rollover) and clears that node's prior
+     `readings` so ingestion keeps flowing either way, rather than silently
+     freezing on `ON CONFLICT DO NOTHING` (`raw_frames`/`readings_rollup`
+     untouched; `status().sessions_reset` / `status().wraps_handled` count each
+     separately -- a wrap is routine, a reboot is not).
      Includes a derived `tof_out_of_range` bool (raw `tof_mm` above
      `TOF_MAX_VALID_MM`, the VL53L0X no-target sentinel) computed in
      `ingest/serial_reader.py` -- **not** in the codec, so the two `protocol.py`
