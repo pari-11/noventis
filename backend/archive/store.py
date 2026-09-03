@@ -87,6 +87,16 @@ class ArchiveStore(Protocol):
     def exists(self, key: str) -> bool:
         ...
 
+    def get_bytes(self, key: str) -> bytes | None:
+        """Read an object back, or None if absent.
+
+        Needed because an hour's manifest is read-modify-write: an hour can be
+        sealed more than once (a restart mid-hour seals a partial segment, and
+        the rest of that hour is sealed later), so each seal must ADD a part
+        rather than replace what is already there.
+        """
+        ...
+
     def uri(self, key: str) -> str:
         ...
 
@@ -138,6 +148,10 @@ class LocalStore:
 
     def exists(self, key: str) -> bool:
         return self._path(key).is_file()
+
+    def get_bytes(self, key: str) -> bytes | None:
+        p = self._path(key)
+        return p.read_bytes() if p.is_file() else None
 
     def uri(self, key: str) -> str:
         return self._path(key).as_uri()

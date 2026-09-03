@@ -534,51 +534,105 @@ class ArchiveWriter:
 
     # -- compaction ------------------------------------------------------ #
     def _compact(self, spool_path: Path, node_id: int, hour_key: str) -> None:
-        """Seal one finished hour: gzip it, store it, then publish its manifest.
+        """Seal one spool file as a new PART of its hour. Never overwrites.
 
-        Ordering is the durability contract. The data object is stored (and
-        fsynced) BEFORE the manifest that certifies it, so a crash in between
-        leaves an hour with data and no manifest -- uncertified, therefore not
-        deletable. The reverse order could certify data that was never stored.
+        An hour can be sealed more than once: shutdown force-closes whatever hour
+        is currently open even though it has not finished yet (see
+        ``_close_finished_hours``), a fresh spool for that same hour is opened
+        after the next start, and it gets its own seal when the hour later ends
+        or the process stops again. A found-by-test bug wrote every seal to the
+        same fixed key ``part-0000.ndjson.gz``: the second seal silently
+        overwrote the first, destroying already-durable rows (219 written, then
+        67 survived, then 61 -- discovered via scripts/verify_archive.py finding
+        readings the database had that the archive did not).
+
+        Fix: each seal becomes its own numbered part
+        (``part-0000.ndjson.gz``, ``part-0001.ndjson.gz``, ...), and the hour's
+        manifest is read-modify-write -- the existing manifest (if any) is read
+        back via ``store.get_bytes`` and the new part is APPENDED to its
+        ``parts`` list, never replacing what was already certified. Every prior
+        part's stats stay exactly as they were: this can only add a part, never
+        touch or reinterpret an existing one.
+
+        Part index comes from the existing manifest, not from listing the
+        store -- ``ArchiveStore`` only promises get/put, no listing, so this
+        works unchanged against a future object-store backend that has no cheap
+        directory listing.
+
+        Ordering is still the durability contract: each part's data object is
+        stored (and fsynced) before the manifest that certifies it, so a crash
+        in between leaves a part with data and no manifest entry -- uncertified,
+        therefore not deletable, never certifying data that was never stored.
         """
         stats = scan_spool_file(spool_path)
-        complete = stats["gaps"] == 0 and stats["closed"] and not stats["truncated"]
-        if not complete:
-            self._incomplete_hours += 1
+        part_complete = stats["gaps"] == 0 and stats["closed"] and not stats["truncated"]
+
+        manifest_key = _partition_key(node_id, hour_key, "_manifest.json")
+        existing = self._store.get_bytes(manifest_key)
+        manifest = json.loads(existing) if existing else None
+        parts: list[dict] = list(manifest["parts"]) if manifest else []
+        part_index = len(parts)
+        part_name = f"part-{part_index:04d}.ndjson.gz"
 
         with tempfile.TemporaryDirectory(prefix="noventis-compact-") as td:
-            gz = Path(td) / "part-0000.ndjson.gz"
+            gz = Path(td) / part_name
             with open(spool_path, "rb") as src, gzip.open(gz, "wb", compresslevel=6) as dst:
                 shutil.copyfileobj(src, dst)
 
-            data_key = _partition_key(node_id, hour_key, "part-0000.ndjson.gz")
+            data_key = _partition_key(node_id, hour_key, part_name)
             self._store.put(gz, data_key)
 
-            manifest = {
-                "schema": 1,
-                "node_id": node_id,
-                "hour": hour_key,
-                "rows_written": stats["rows"],
-                "drops_observed": stats["gaps"],
-                "seq_gaps_observed": stats["seq_gaps"],
+            parts.append({
+                "key": data_key,
+                "rows": stats["rows"],
+                "drops": stats["gaps"],
+                "seq_gaps": stats["seq_gaps"],
                 "sealed": stats["closed"],
                 "truncated": stats["truncated"],
-                # "no loss OBSERVED BY THE BACKEND" -- see the module docstring.
-                "complete": complete,
+                "complete": part_complete,
                 "bytes_gz": gz.stat().st_size,
                 "sha256": sha256_file(gz),
-                "data_key": data_key,
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            # Aggregate over every part sealed for this hour so far. A prior
+            # part's own complete=false (a drop, a crash) can never be undone by
+            # a later, cleaner part -- one bad part taints the whole hour.
+            agg_complete = all(p["complete"] for p in parts)
+            manifest_out = {
+                "schema": 2,
+                "node_id": node_id,
+                "hour": hour_key,
+                "rows_written": sum(p["rows"] for p in parts),
+                "drops_observed": sum(p["drops"] for p in parts),
+                "seq_gaps_observed": sum(p["seq_gaps"] for p in parts),
+                "sealed": all(p["sealed"] for p in parts),
+                "truncated": any(p["truncated"] for p in parts),
+                # "no loss OBSERVED BY THE BACKEND" -- see the module docstring.
+                # A backend restart mid-hour is itself a window the archive
+                # cannot see into (no code runs while the process is down), so
+                # more than one part is flagged rather than silently merged as
+                # if the hour were one continuous, gapless capture.
+                "complete": agg_complete,
+                "multi_part": len(parts) > 1,
+                "parts": parts,
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }
             mpath = Path(td) / "_manifest.json"
-            mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-            self._store.put(mpath, _partition_key(node_id, hour_key, "_manifest.json"))
+            mpath.write_text(json.dumps(manifest_out, indent=2), encoding="utf-8")
+            self._store.put(mpath, manifest_key)
 
+        if not part_complete:
+            self._incomplete_hours += 1
         self._segments += 1
         spool_path.unlink(missing_ok=True)
         fsync_dir(spool_path.parent)
-        log.info("archive: sealed node=%s hour=%s rows=%d complete=%s (%d bytes gz)",
-                 node_id, hour_key, stats["rows"], complete, manifest["bytes_gz"])
+        log.info(
+            "archive: sealed node=%s hour=%s part=%d rows=%d part_complete=%s "
+            "hour_complete=%s (%d bytes gz)",
+            node_id, hour_key, part_index, stats["rows"], part_complete,
+            manifest_out["complete"], parts[-1]["bytes_gz"],
+        )
 
     def _recover_orphans(self) -> None:
         """Compact spool files left by a previous run.
