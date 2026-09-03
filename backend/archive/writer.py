@@ -45,11 +45,17 @@ HONEST DURABILITY
     readings would be gone while everything reported success. That is worse than
     today's honest timer-based deletion.
 
-    Therefore: every drop -- from the bus (detected via ``bus.dropped_for``) or
-    from this module's own queue -- writes a ``_gap`` record **into the spool file
-    itself**, so the taint travels with the data and survives a crash that would
-    erase an in-memory counter. Any hour containing a gap is ``complete: false``
-    and can never be certified.
+    Therefore: every drop -- from the bus (detected via ``bus.dropped_for``),
+    from this module's own queue, or from an unhandled exception while
+    processing one event (``_run``'s per-event try/except, mirroring
+    ``db.writer``'s) -- writes a ``_gap`` record **into the spool file itself**,
+    so the taint travels with the data and survives a crash that would erase an
+    in-memory counter. Any hour containing a gap is ``complete: false`` and can
+    never be certified. The per-event guard also means one malformed event can
+    never silently kill the subscriber for the rest of the process's life --
+    found live 2026-09-05: the loop here had no such guard, unlike ``db.writer``,
+    so a single bad event would have stopped archiving permanently while the
+    dashboard kept looking completely healthy.
 
     ``complete`` means **no loss observed by the backend** -- nothing stronger is
     knowable here. A frame lost over the air, or one the node never sent, leaves
@@ -343,15 +349,38 @@ class ArchiveWriter:
         async for event in self._bus.subscribe("archive"):
             if not event.get("crc_ok"):
                 continue
-            # Did the BUS drop anything for us since last time? If so the hole is
-            # already in the past; record it before the next row so the marker
-            # lands in the right hour.
-            dropped = self._bus.dropped_for("archive")
-            if dropped > self._bus_drops_seen:
-                missed = dropped - self._bus_drops_seen
-                self._bus_drops_seen = dropped
-                self._note_gap(missed, "bus")
-            self._offer(archive_row(event))
+            try:
+                # Did the BUS drop anything for us since last time? If so the
+                # hole is already in the past; record it before the next row so
+                # the marker lands in the right hour.
+                dropped = self._bus.dropped_for("archive")
+                if dropped > self._bus_drops_seen:
+                    missed = dropped - self._bus_drops_seen
+                    self._bus_drops_seen = dropped
+                    self._note_gap(missed, "bus")
+                self._offer(archive_row(event))
+            except Exception:
+                # Mirrors db.writer's per-event guard: one bad event must not
+                # take the whole subscriber down. Without this, an unhandled
+                # exception here (e.g. archive_row() on a malformed event) kills
+                # this async-for permanently -- `status()["subscribed"]` flips to
+                # False, but nothing polls or alerts on that, so the archive
+                # would silently stop recording for the rest of the process's
+                # life while the live feed and SQLite kept working normally,
+                # looking completely healthy from the dashboard.
+                #
+                # Counted as a drop, not just an error: this reading genuinely
+                # never reached the archive, so the currently open hour(s) must
+                # not be certifiable as complete -- the same honesty this module
+                # already applies to a bus or internal-queue drop.
+                self._errors += 1
+                self._note_gap(1, "processing_error")
+                log.exception(
+                    "archive: could not process event (node=%s seq=%s) -- "
+                    "counted as a drop so the hour cannot be certified complete "
+                    "on data actually lost here",
+                    event.get("node_id"), event.get("seq_num"),
+                )
 
     def _note_gap(self, n: int, reason: str) -> None:
         """Signal a hole to the writer thread OUT OF BAND.

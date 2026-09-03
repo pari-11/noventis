@@ -63,17 +63,56 @@ RESTART_WRAP_BAND = SEQ_SPACE - RESTART_BACKSTEP_MIN
 RESTART_SILENCE_S = 2.0
 
 
+def _backstep(prev_seq: int, seq: int) -> int:
+    """How far ``seq`` moved backward from ``prev_seq``. Negative = forward."""
+    return prev_seq - seq
+
+
 def _looks_like_restart(
     prev_seq: int | None, prev_ts: datetime | None, seq: int, now: datetime
 ) -> bool:
+    """A node reboot: ``seq_num`` resets near 0 from an arbitrary point, after
+    the node has gone quiet. Deliberately excludes the legitimate end-of-space
+    wrap (``_looks_like_wrap``, below) -- that is a routine event mid-session,
+    not a restart, and must not be counted or logged as one.
+    """
     if prev_seq is None:
         return False
-    backstep = prev_seq - seq
+    backstep = _backstep(prev_seq, seq)
     if backstep < RESTART_BACKSTEP_MIN or backstep > RESTART_WRAP_BAND:
         return False
     if prev_ts is not None and (now - prev_ts).total_seconds() < RESTART_SILENCE_S:
         return False
     return True
+
+
+def _looks_like_wrap(prev_seq: int | None, seq: int) -> bool:
+    """The legitimate ``0xFFFF -> 0x0000`` rollover, mid-session.
+
+    ``seq_num`` is uint16, so at ~2 Hz it wraps roughly every 9.1 h of
+    continuous uptime -- inside ``READINGS_FULL_RES_HOURS``' default 168 h
+    window. Without clearing on this event, the very first reading after a
+    wrap collides with the still-resident row from ~9 h earlier on the
+    ``(node_id, seq_num)`` unique constraint; ``ON CONFLICT DO NOTHING``
+    silently discards it, and then EVERY reading after that too, forever --
+    nothing ever frees that seq_num again within the window. `readings`
+    ingestion for that node would freeze permanently, invisibly (only
+    ``readings_duplicate`` climbing, uncapped and unalarmed, in `/health`).
+
+    The live `/live` feed and the archive tier are unaffected either way --
+    neither dedupes on `seq_num` -- so nothing is actually lost; only the
+    SQLite-backed History view would silently stop advancing. This is a
+    structural ceiling on `readings`, not a bug to route around: a single
+    node's full-resolution capacity there is bounded by `seq_num`'s ~9.1 h
+    range regardless of `READINGS_FULL_RES_HOURS`. The archive is where full
+    resolution actually lives past that.
+
+    No silence check, unlike a restart: a wrap happens mid-stream during
+    perfectly healthy, continuous operation, not after a gap.
+    """
+    if prev_seq is None:
+        return False
+    return _backstep(prev_seq, seq) > RESTART_WRAP_BAND
 
 
 class DBWriter:
@@ -85,6 +124,7 @@ class DBWriter:
         self._readings_written = 0
         self._readings_duplicate = 0
         self._sessions_reset = 0
+        self._wraps_handled = 0
         self._errors = 0
         # per-node: last seq_num and receipt time of a reading-bearing frame
         self._last_seq: dict[int, int] = {}
@@ -112,6 +152,7 @@ class DBWriter:
             "readings_written": self._readings_written,
             "readings_duplicate": self._readings_duplicate,
             "sessions_reset": self._sessions_reset,
+            "wraps_handled": self._wraps_handled,
             "errors": self._errors,
         }
 
@@ -187,6 +228,22 @@ class DBWriter:
                             "node %s seq restarted (last %s -> now %s); cleared its "
                             "prior readings so the new session ingests -- raw_frames "
                             "is untouched",
+                            node_id, prev_seq, seq,
+                        )
+                    elif _looks_like_wrap(prev_seq, seq):
+                        # Routine, not a fault -- see _looks_like_wrap's docstring
+                        # for why this must clear too, not just skip. INFO, not
+                        # WARNING: this is expected to happen roughly every 9 h of
+                        # continuous uptime, unlike an actual restart.
+                        await session.execute(
+                            delete(Reading).where(Reading.node_id == node_id)
+                        )
+                        self._wraps_handled += 1
+                        log.info(
+                            "node %s seq wrapped (last %s -> now %s, routine "
+                            "0xFFFF->0x0000 rollover, not a restart); cleared its "
+                            "prior readings so the new lap can ingest -- archive/ "
+                            "and /live are unaffected, nothing is actually lost",
                             node_id, prev_seq, seq,
                         )
 
