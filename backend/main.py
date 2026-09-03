@@ -11,6 +11,10 @@ Lifespan startup, in order:
   3. ConnectionManager.start()       -- subscribes to the event bus (independently)
   4. FrameRingBuffer.start()         -- subscribes to the event bus (independently);
                                         in-memory ring of recent frames
+  4b. ArchiveWriter.start()          -- subscribes to the event bus (independently);
+                                        append-only archive of every CRC-valid
+                                        reading (the system of record). Owns a
+                                        writer thread; no file I/O on the loop.
   5. RetentionJob.start()            -- periodic readings rollup + retention
   6. SerialReader.start()            -- owns the CP2102 port in a background thread;
                                         publishes frames onto the bus via a
@@ -45,6 +49,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 
 from .api import debug, nodes, raw_frames, readings
+from .archive.writer import ArchiveWriter
 from .db.models import Node
 from .db.retention import RetentionJob
 from .db.session import SessionLocal, dispose, init_db
@@ -83,10 +88,12 @@ async def lifespan(app: FastAPI):
     writer = DBWriter(bus)
     ws_manager = ConnectionManager(bus)
     frame_buffer = FrameRingBuffer(bus)
+    archive = ArchiveWriter(bus)
     writer.start()
     ws_manager.start()
     frame_buffer.start()
-    await asyncio.sleep(0)  # let the subscriber tasks reach bus.subscribe() before frames flow
+    archive.start()          # MUST be here, with the other subscribers...
+    await asyncio.sleep(0)   # ...i.e. before this, or it silently misses the first frames
 
     retention = RetentionJob()
     retention.start()
@@ -98,6 +105,7 @@ async def lifespan(app: FastAPI):
     reader.start()
 
     app.state.reader = reader
+    app.state.archive = archive
     app.state.writer = writer
     app.state.ws_manager = ws_manager
     app.state.frame_buffer = frame_buffer
@@ -108,6 +116,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await asyncio.to_thread(reader.stop)
+        # Archive next, and by DRAINING rather than cancelling: its subscriber
+        # queue still holds events, and cancelling would discard them -- losing
+        # the last seconds of every run in the tier meant to lose nothing.
+        await archive.stop()
         await retention.stop()
         await frame_buffer.stop()
         await ws_manager.stop()
@@ -153,6 +165,7 @@ async def health() -> dict:
         "ws": app.state.ws_manager.status(),
         "bus": bus.status(),
         "frame_buffer": app.state.frame_buffer.status(),
+        "archive": app.state.archive.status(),
         "retention": app.state.retention.status(),
     }
 
