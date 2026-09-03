@@ -2,3 +2,9 @@
 # (core.autocrlf=true would otherwise check them out as CRLF, and a `#!/bin/sh\r`
 # shebang fails with "bad interpreter" on any POSIX shell / WSL).
 .githooks/** text eol=lf
+
+# Constraint #2: these two must be byte-for-byte identical in EVERY checkout.
+# Without this, core.autocrlf rewrites them on checkout, so "identical" would
+# depend on the platform you cloned on. Pin them to the bytes in the repo.
+edge/protocol.py            -text
+backend/ingest/protocol.py  -text
