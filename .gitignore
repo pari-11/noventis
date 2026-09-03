@@ -31,5 +31,7 @@ ds-bundle/
 .design-sync/learnings/
 .design-sync/node_modules
 
-# Archive tier (system of record; back this up, do not commit it)
-archive/
+# Archive tier DATA (system of record; back this up, do not commit it).
+# Leading slash anchors to the repo root -- a bare `archive/` also matches
+# backend/archive/, which is SOURCE and must be committed.
+/archive/
