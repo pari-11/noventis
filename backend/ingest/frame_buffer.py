@@ -111,7 +111,7 @@ class FrameRingBuffer:
 
     async def _run(self) -> None:
         log.info("frame ring buffer subscribed to event bus (capacity=%d)", self._buf.maxlen)
-        async for event in self._bus.subscribe():
+        async for event in self._bus.subscribe("frame-buffer"):
             try:
                 self.record_event(event)
             except Exception:  # pragma: no cover - a bad event must not kill the loop

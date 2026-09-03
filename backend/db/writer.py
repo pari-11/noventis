@@ -118,7 +118,7 @@ class DBWriter:
     # -- loop ---------------------------------------------------------- #
     async def _run(self) -> None:
         log.info("db writer subscribed to event bus")
-        async for event in self._bus.subscribe():
+        async for event in self._bus.subscribe("db-writer"):
             try:
                 await self._persist(event)
             except Exception:

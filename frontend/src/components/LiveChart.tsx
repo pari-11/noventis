@@ -214,7 +214,15 @@ function fmtValue(key: SeriesKey, v: number): string {
 }
 
 /** One row per frame on a strictly-increasing timeline (2 Hz frames stay unique). */
-type Frame = { time: UTCTimestamp; tof?: number; tofOor?: boolean; accel?: number; gyro?: number }
+type Frame = {
+  time: UTCTimestamp
+  tof?: number
+  tofOor?: boolean
+  accel?: number
+  gyro?: number
+  /** Messages were dropped before this frame -- break the line here. */
+  gapBefore?: boolean
+}
 
 function toFrames(messages: LiveMessage[]): Frame[] {
   const out: Frame[] = []
@@ -224,6 +232,7 @@ function toFrames(messages: LiveMessage[]): Frame[] {
     if (!(t > lastT)) t = lastT + 0.001
     lastT = t
     const f: Frame = { time: t as UTCTimestamp }
+    if (m.gapBefore) f.gapBefore = true
     if (m.values.tof_mm != null) {
       f.tof = m.values.tof_mm
       f.tofOor = !!m.values.tof_out_of_range
@@ -505,6 +514,20 @@ export function LiveChart({ nodeId, nodeName }: Props) {
         }
       }
       lineData = [...lineData, ...gapTimes.map((time) => ({ time }) as WhitespaceData)].sort(
+        (x, y) => (x.time as number) - (y.time as number),
+      )
+    }
+
+    // Connection gaps: the server had to drop messages for this client (a slow
+    // or backgrounded tab). Those samples exist on the backend but never reached
+    // us, so break the line rather than drawing a straight segment across the
+    // hole -- an interpolated line there reads as real, steady data. Applies to
+    // every series, unlike the ToF-only out-of-range break above.
+    const connGaps = win
+      .filter((f) => f.gapBefore)
+      .map((f) => ({ time: ((f.time as number) - 0.001) as UTCTimestamp }) as WhitespaceData)
+    if (connGaps.length) {
+      lineData = [...lineData, ...connGaps].sort(
         (x, y) => (x.time as number) - (y.time as number),
       )
     }
