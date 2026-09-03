@@ -34,7 +34,13 @@ dashboard shows live and historical data.
 - `db/writer.py` -- **event-bus subscriber.** Writes `raw_frames` only for
   **CRC-failed** frames; `readings` + `nodes.last_seen` when `crc_ok`.
 - `ws/manager.py` -- **event-bus subscriber.** Fans CRC-valid readings out to
-  `/live` WebSocket clients, filtered by `node_id`.
+  `/live` WebSocket clients, filtered by `node_id`, through a per-connection
+  bounded outbox + send task -- one slow client drops only its own oldest
+  messages (told via a `{"type":"gap"}` control message) and can never block
+  the broadcast to anyone else.
+- `archive/writer.py`, `archive/store.py` -- **event-bus subscriber** (the
+  fourth, alongside the three above). System of record: every CRC-valid
+  reading, full resolution, forever, in `archive/` -- see "Archive tier" below.
 - `db/retention.py` -- periodic task (hourly). Rolls `readings` older than
   `READINGS_FULL_RES_HOURS` (default **168** = 7 days) into per-node
   `ROLLUP_INTERVAL_MINUTES` buckets in `readings_rollup` (avg + min + max),
@@ -45,7 +51,11 @@ dashboard shows live and historical data.
 - `scripts/backup_db.py` -- consistent snapshot (`VACUUM INTO`) safe to run with
   the backend live. `scripts/migrate_purge_legacy_frames.py` -- deliberate,
   prompted, operator-run purge of pre-model-change CRC-valid `raw_frames` rows
-  (never done automatically).
+  (never done automatically). `scripts/verify_archive.py` -- reconciles
+  `archive/` against `readings` and verifies every sealed manifest.
+  `scripts/check_protocol_sync.py` / `sync_protocol.py` -- enforce and repair
+  the two `protocol.py` modules staying byte-identical; wired into
+  `.githooks/pre-commit`.
 
 ### frontend/  (React + Vite + TypeScript)
 - `App.tsx` owns the selected `node_id`.
@@ -58,15 +68,19 @@ dashboard shows live and historical data.
 serial bytes  (0xAA55-framed; see protocol-spec.md)
   -> serial_reader: resync on SYNC, slice candidate frame, parse_frame()
   -> event_bus.publish(FrameEvent{ raw, crc_ok, node_id, seq_num, values, received_at })
-       |-> frame_buffer: append to the in-memory ring (every candidate frame)
-       |-> db.writer   : if NOT crc_ok -> INSERT raw_frames;
-       |                 if crc_ok -> UPSERT node, INSERT reading (idempotent)
-       `-> ws.manager  : if crc_ok -> JSON to matching /live clients
+       |-> frame_buffer  : append to the in-memory ring (every candidate frame)
+       |-> db.writer     : if NOT crc_ok -> INSERT raw_frames;
+       |                   if crc_ok -> UPSERT node, INSERT reading (idempotent)
+       |-> ws.manager    : if crc_ok -> JSON to matching /live clients' outboxes
+       `-> archive.writer: if crc_ok -> queue.Queue.put_nowait (one call; a
+                           dedicated thread does the actual file write + fsync,
+                           never the event loop)
 ```
 
 Separately, `db.retention` runs hourly off the request path: it aggregates
 `readings` rows older than `READINGS_FULL_RES_HOURS` into `readings_rollup`
-buckets and deletes them. `GET /readings` merges the two tiers on read.
+buckets and deletes them. `GET /readings` merges the two tiers on read. This is
+**not yet gated on the archive tier** -- see "Archive tier" below.
 
 `values` holds the decoded keys `tof_mm`, `accel_mss`, `gyro_rads`
 (see protocol-spec.md §3); `db.writer` flattens the vectors into the
@@ -76,9 +90,82 @@ VL53L0X no-target sentinel) — carried on the bus and stored in
 `readings.tof_out_of_range`. The wire format and both `protocol.py` modules are
 unchanged.
 
-`frame_buffer`, `db.writer` and `ws.manager` subscribe **independently**. None
-imports pyserial or touches the port. If one is slow or crashes, the others are
-unaffected.
+`frame_buffer`, `db.writer`, `ws.manager` and `archive.writer` subscribe
+**independently**. None imports pyserial or touches the port. If one is slow or
+crashes, the others are unaffected -- each also gets its own named subscription
+(`bus.subscribe("db-writer")`, etc.) so `GET /health`'s `bus.by_subscriber` can
+attribute a drop to whichever one actually lagged, not just report a single
+total.
+
+## Archive tier
+
+`backend/archive/writer.py` is the system of record: every CRC-valid reading is
+appended, at full resolution, forever, independent of whatever
+`READINGS_FULL_RES_HOURS` SQLite is configured to keep. SQLite's `readings`
+table is a disposable, bounded cache in front of it -- the archive is what
+makes shrinking that window (a deferred production step) safe.
+
+**Why two threads.** `open()`/`write()`/`fsync()` are blocking syscalls, and
+`fsync` has unbounded worst-case latency on a busy disk. Inline on the event
+loop that would freeze the WebSocket broadcast and every HTTP handler, same as
+serial I/O. So the async bus subscriber does exactly one
+`queue.Queue.put_nowait()` per reading -- no serialising, no file handles, no
+syscalls -- and a dedicated writer thread owns all file I/O.
+
+**Layout.**
+
+```
+archive/spool/node=1/2026-09-03T13.ndjson                              <- open, being appended
+archive/data/readings/node_id=1/date=2026-09-03/hour=13/part-0000.ndjson.gz
+archive/data/readings/node_id=1/date=2026-09-03/hour=13/part-0001.ndjson.gz
+archive/data/readings/node_id=1/date=2026-09-03/hour=13/_manifest.json
+```
+
+Live writes are newline-delimited JSON (a crash costs at most one truncated
+line, unlike a columnar format that needs a valid footer). A finished hour is
+gzip-compressed and handed to `archive/store.py`'s `ArchiveStore` seam
+(`put`/`exists`/`get_bytes`/`uri`) -- `LocalStore` today; a cloud store later is
+one more implementation of that interface, with nothing else in the codebase
+changing. Hive-style partition keys (`node_id=`/`date=`/`hour=`) let a future
+query engine (DuckDB, Athena) prune without listing every object.
+
+**Multi-part, never overwritten.** An hour can be sealed more than once: a
+restart force-closes whatever hour is currently open, even one that has not
+finished, and the process resumes into the same hour afterward. Each seal is
+its own numbered part rather than replacing the last one -- an earlier version
+always wrote `part-0000.ndjson.gz` and a second restart's seal silently
+destroyed the first (found live 2026-09-04 via `verify_archive.py`: a sealed
+hour's row count shrank across restarts while SQLite held far more for the same
+hour). The manifest is read-modify-write: the existing one (if any) is read
+back through `store.get_bytes()` and the new part appended to its `parts` list;
+`rows_written` / `drops_observed` / `complete` are aggregates over every part.
+
+**Durability is honest, not optimistic.** The event bus drops events when a
+subscriber lags -- correct behaviour, since blocking ingestion would be worse.
+But a drop the archive did not notice would let it *lie*: compaction would
+stamp the hour complete, retention (once gated on this) would trust that and
+delete the SQLite copy, and the reading would be gone while everything reported
+success. So every drop -- from the bus (`bus.dropped_for("archive")`) or the
+writer's own internal queue -- writes a `_gap` record **into the spool file
+itself**, out of band from the row queue so a full queue can never swallow the
+notice that the queue is full. Any hour containing one is `complete: false`
+forever. `complete: true` means **no loss observed by the backend**; nothing
+stronger is knowable, since a frame lost over the air leaves only a `seq_num`
+gap and no backend design recovers it (protocol-spec §6).
+
+`seq_gaps_observed` records those RF-loss-shaped gaps separately and does not
+affect `complete`. It is seeded across restarts too (`_recover_last_seq`, reading
+the most recently sealed manifest's last `seq_num` per node back at startup) so
+a gap landing exactly on a restart boundary is still counted, not just gaps
+within one continuous run.
+
+**Verification, not yet gating.** `scripts/verify_archive.py` reconciles the
+archive against `readings` for the overlap window and verifies every sealed
+manifest's checksum and row count. `db/retention.py` does **not** yet consult
+manifests before deleting -- it still runs on its existing timer, deliberately,
+until the archive has proven itself. `GET /readings` does not read the archive
+either; it is write-only insurance for now. Both are the deferred next steps,
+along with a cloud `ArchiveStore` implementation.
 
 ## Data model
 
@@ -105,8 +192,10 @@ DB to incremental mode).
 
 `READINGS_FULL_RES_HOURS` (env `NOVENTIS_READINGS_FULL_RES_HOURS`, **default 168 =
 7 days**) is the production tuning knob: how far back full-resolution ~0.5 s
-(2 Hz) data stays in `readings` before it is collapsed to 1-minute
-avg/min/max rows and the originals are **permanently deleted**. Cost is linear:
+(2 Hz) data stays *queryable* in `readings` before it is collapsed to 1-minute
+avg/min/max rows and the originals are **permanently deleted from SQLite** (see
+"Archive tier" above -- they are not gone from `archive/`, just no longer
+queryable through the API). Cost is linear:
 
 | | rows | on disk (measured ~156 B/row incl. both indexes) |
 |---|--:|--:|
@@ -120,11 +209,16 @@ deployment stays well under 200 MB and even five nodes under 1 GB -- comfortable
 for SQLite. Only `readings_rollup` grows unbounded, and slowly; a second coarser
 tier (deferred) would cap that if it ever matters.
 
-**Backups.** The dataset is one SQLite file. `scripts/backup_db.py` takes a
-consistent `VACUUM INTO` snapshot safely while the backend runs (a raw copy of a
-live WAL DB can be torn). Run it at least daily (cron / Task Scheduler).
-Fine-grained readings older than `READINGS_FULL_RES_HOURS` are gone once rolled
-up -- if the raw 2 Hz data matters, a backup must land inside that window.
+**Backups.** `scripts/backup_db.py` takes a consistent `VACUUM INTO` snapshot of
+`noventis.db` safely while the backend runs (a raw copy of a live WAL DB can be
+torn). Run it at least daily (cron / Task Scheduler). Fine-grained readings older
+than `READINGS_FULL_RES_HOURS` stop being **queryable** through `GET /readings`
+once rolled up -- but as of the archive tier (see above) they are **recoverable**
+from `archive/`, just not yet queryable there (a deferred deep-history read tier
+would restore that). For anything that must stay queryable, a backup still needs
+to land inside the window. `archive/` is a second dataset now, and a single disk
+copy until a cloud store is wired in -- back it up too for anything that must
+not be lost outright, not just kept queryable.
 
 The unique `(node_id, seq_num)` constraint makes re-ingestion (replaying a serial
 capture, restarting the reader) idempotent *within a session* -- duplicate
@@ -156,12 +250,17 @@ writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
 | GET    | `/debug/frames`             | window onto the in-memory frame ring buffer (recent frames, CRC pass + fail); `limit`, `crc_ok`, `node_id` filters; empty after a restart |
 | PATCH  | `/nodes/{node_id}`          | set display name; body `{"name": "<1..64 chars>"}`; returns the updated node (404 unknown node, 422 blank name) |
 | POST   | `/rescan`                   | force serial CP2102 auto-detect to re-run; waits a bounded window and returns `{ok, connected, port, last_error}` |
-| WS     | `/live?node_id=<id>`        | sends `{"type":"ready","node_id":…}` on connect, then one JSON message per CRC-valid frame (`{node_id, seq_num, ts, values}`, `ts` ISO-8601); omit `node_id` for all |
+| WS     | `/live?node_id=<id>`        | data message carries no `type` (`{node_id, seq_num, ts, values}`, `ts` ISO-8601); control messages do and unrecognised ones must be ignored: `{"type":"ready","node_id":…}` on connect, `{"type":"gap","dropped":n}` when this client's own outbox overflowed, `{"type":"ping","ts":…}` liveness to an idle client only; omit `node_id` for all nodes; beyond `MAX_WS_CONNECTIONS` (default 32) a new connection is refused with close code 1013 |
 
 `GET /health` additionally reports `frame_buffer` (ring `size`/`capacity`/
-`received_total`) and `retention` (`passes`, `buckets_written`,
-`readings_rolled_up`, `last_pass_at`, `auto_vacuum_mode`, …) so both are
-verifiable at a glance.
+`received_total`), `retention` (`passes`, `buckets_written`,
+`readings_rolled_up`, `last_pass_at`, `auto_vacuum_mode`, …), `bus`
+(`by_subscriber`: per-subscriber queued/delivered/dropped, keyed by the name
+passed to `subscribe()`), `ws` (`connections`, `max_connections`,
+`client_queue_max`, `messages_sent`/`dropped`, `connections_rejected`, per-client
+detail) and `archive` (`rows_written`, `queued`, `open_hours`,
+`segments_sealed`, `incomplete_hours`, `bus_drops`, `queue_drops`,
+`spool_bytes`, `last_fsync_at`, …) so all are verifiable at a glance.
 
 `POST /rescan` sets a flag on the `SerialReader` background thread
 (`request_rescan()`), which drops any open port and re-runs `select_port` on its
@@ -195,3 +294,13 @@ See [protocol-spec.md](protocol-spec.md) -- the source of truth for both
 - A server-side "all history" downsample on `GET /readings` (today the endpoint
   merges `readings` + `readings_rollup` but is `limit`-bounded, max 2000 rows;
   it does not decimate a multi-week span into a fixed point budget).
+- A cloud `ArchiveStore` implementation (`LocalStore` is the only one today;
+  the interface is the seam this is deferred behind).
+- A read tier over the archive (e.g. DuckDB against the Parquet/NDJSON.gz
+  segments) so `GET /readings` can reach past `READINGS_FULL_RES_HOURS` into
+  full-resolution history instead of only the 1-minute rollup.
+- Gating `db/retention.py`'s deletion on archive manifests being `complete`
+  (today retention runs on its timer regardless; `verify_archive.py` is the
+  interim way to trust the archive before wiring that gate).
+- Lowering `READINGS_FULL_RES_HOURS` below 168 (safe only once the two items
+  above exist -- until then SQLite is the only queryable copy of full-res data).

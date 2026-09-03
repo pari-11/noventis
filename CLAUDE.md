@@ -13,13 +13,17 @@ The full pipeline is built and covered by integration tests
 (`scratchpad/test_layer*.py` while under development):
 
     CP2102 serial (thread) -> protocol.parse_frame -> EventBus (fan-out)
-        |-> frame_buffer : in-memory ring of recent frames (every candidate; GET /debug/frames)
-        |-> db.writer    : raw_frames (CRC-FAIL only) + nodes.last_seen + readings (CRC-ok, idempotent)
-        `-> ws.manager   : JSON push to /live clients (CRC-ok only), node_id-filtered
+        |-> frame_buffer   : in-memory ring of recent frames (every candidate; GET /debug/frames)
+        |-> db.writer      : raw_frames (CRC-FAIL only) + nodes.last_seen + readings (CRC-ok, idempotent)
+        |-> ws.manager     : JSON push to /live clients (CRC-ok only), node_id-filtered,
+        |                    per-connection outbox so one slow client can't stall the rest
+        `-> archive.writer : every CRC-valid reading, full resolution, forever, to
+                             archive/ (own writer thread; system of record -- see constraint #8)
 
     db.retention (hourly, off the request path): readings older than
       READINGS_FULL_RES_HOURS -> readings_rollup buckets (avg+min+max), originals
       deleted; incremental_vacuum. GET /readings merges both tiers on read.
+      NOT yet gated on the archive tier -- see constraint #8.
 
 - `edge/protocol.py` == `backend/ingest/protocol.py` -- TLV + CRC-16-CCITT codec
   for the shipped `0xAA55` frame format, plus `extract_frames` stream de-framer
@@ -36,12 +40,23 @@ The full pipeline is built and covered by integration tests
   `INSERT ... ON CONFLICT DO NOTHING` on `(node_id, seq_num)`
 - `backend/db/retention.py` -- hourly readings rollup + retention (single tier),
   thresholds as named constants at the top
-- `backend/ws/manager.py` -- `/live` connection registry + broadcast loop
+- `backend/ws/manager.py` -- `/live` connection registry; per-connection outbox
+  + send task (one slow client can never stall the others); `{"type":"gap"}` /
+  `{"type":"ping"}` control messages alongside the unchanged data-frame contract
+- `backend/archive/writer.py` -- fourth independent bus subscriber; append-only
+  archive, full resolution, forever (see constraint #8)
+- `backend/archive/store.py` -- `ArchiveStore` seam (`LocalStore` today; a cloud
+  store later is one more implementation, nothing else in the codebase changes)
 - `backend/api/{nodes,readings,raw_frames,debug}.py` -- the REST routers
 - `backend/main.py` -- lifespan wiring + `/health`
 - `scripts/backup_db.py` -- consistent snapshot (`VACUUM INTO`) while the backend
   runs; `scripts/migrate_purge_legacy_frames.py` -- deliberate, prompted one-off
-  cleanup of pre-model-change CRC-valid `raw_frames` rows
+  cleanup of pre-model-change CRC-valid `raw_frames` rows;
+  `scripts/verify_archive.py` -- reconciles `archive/` against `readings`, and
+  verifies every sealed manifest's checksum and row count
+- `scripts/check_protocol_sync.py` / `scripts/sync_protocol.py` -- enforce and
+  repair constraint #2; wired into `.githooks/pre-commit`
+  (`git config core.hooksPath .githooks` once per clone)
 - `frontend/src/*` -- `useWebSocket` (backoff reconnect), `NodeSelector`,
   `LiveChart` (dependency-free SVG sparklines), `HistoryPanel`, `App`
 
@@ -70,10 +85,12 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
    event bus.
 
 4. **The event bus is the only coupling.** `backend/ingest/event_bus.py` is an
-   in-process asyncio pub/sub (per-subscriber `asyncio.Queue` fan-out).
-   `backend/db/writer.py`, `backend/ws/manager.py` and
-   `backend/ingest/frame_buffer.py` subscribe **independently**.
-   Nothing outside `backend/ingest/` may import pyserial or touch the serial port.
+   in-process asyncio pub/sub (per-subscriber `asyncio.Queue` fan-out, named via
+   `subscribe("<name>")` so drops are attributable, not just totalled).
+   `backend/db/writer.py`, `backend/ws/manager.py`,
+   `backend/ingest/frame_buffer.py` and `backend/archive/writer.py` subscribe
+   **independently**. Nothing outside `backend/ingest/` may import pyserial or
+   touch the serial port.
 
 5. **Data model:**
    - `nodes`: `node_id`, `last_seen`, `name` (nullable, operator-set via
@@ -113,8 +130,13 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
      (`auto_vacuum=INCREMENTAL`, converted once via a full `VACUUM` in
      `_prepare` -- the only thing `_prepare` does; it never deletes rows).
      **Single tier** -- do not add a coarser second rollup without asking.
-     **Rolled-up fine-grained data is unrecoverable** -- back up within the
-     `READINGS_FULL_RES_HOURS` window (`scripts/backup_db.py`).
+     Rolled-up fine-grained data stops being **queryable** through
+     `GET /readings` once it ages out of this window -- but since the archive
+     tier (constraint #8) it is **recoverable** from `archive/`, just not yet
+     queryable there (that needs a deferred deep-history read tier). For
+     anything that must stay *queryable*, still back up within the window
+     (`scripts/backup_db.py`); `archive/` is a single disk copy until a cloud
+     store is wired in, so back it up too for anything that must not be lost.
 
 6. **Persistence:** SQLAlchemy **async** ORM against **SQLite in WAL mode**. No
    Alembic yet -- `Base.metadata.create_all` is fine at this stage.
@@ -131,17 +153,68 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
      frame ring buffer; same fields as `/raw-frames` except the row id is `seq`
      (the ring's monotonic counter), not `id`. `limit` caps at
      `RAW_FRAME_BUFFER_SIZE`, not 2000.
-   - `GET /health` also reports `frame_buffer` (size/capacity) and `retention`
-     (passes, buckets_written, readings_rolled_up, auto_vacuum_mode, ...).
+   - `GET /health` also reports `frame_buffer` (size/capacity), `retention`
+     (passes, buckets_written, readings_rolled_up, auto_vacuum_mode, ...),
+     `bus` (`by_subscriber`: per-subscriber queued/delivered/dropped, keyed by
+     the name passed to `subscribe()`), `ws` (connections, max_connections,
+     client_queue_max, messages_sent/dropped, connections_rejected, per-client
+     detail) and `archive` (rows_written, queued, open_hours, segments_sealed,
+     incomplete_hours, bus_drops, queue_drops, spool_bytes, last_fsync_at, ...).
    - `PATCH /nodes/{node_id}` -- body `{"name": "..."}`, sets the display name,
      returns the updated node
    - `POST /rescan` -- re-runs the `serial_reader` CP2102 auto-detect
      (`SerialReader.request_rescan()`), waits a bounded window, returns
      `{ok, connected, port, last_error}`. Does not touch pyserial itself.
-   - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes). On
-     connect the server sends `{"type": "ready", "node_id": ...}`, then one JSON
-     message per CRC-valid frame: `{node_id, seq_num, ts, values}` (`ts` is an
-     ISO-8601 string).
+   - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes).
+     Beyond `MAX_WS_CONNECTIONS` (default 32) a new connection is refused with
+     close code 1013. A data message carries no `type` key (unchanged contract:
+     `{node_id, seq_num, ts, values}`, `ts` an ISO-8601 string); every **control**
+     message has one and unrecognised types must be ignored by the client:
+     `{"type":"ready","node_id":...}` once on connect,
+     `{"type":"gap","dropped":n}` when this client's own outbox overflowed (it
+     missed `n` messages -- break the series there, don't interpolate across it),
+     `{"type":"ping","ts":...}` (liveness, sent only to a client whose outbox is
+     already empty). Each connection has its own bounded outbox
+     (`WS_CLIENT_QUEUE_MAX`, default 256); one slow client drops only its own
+     oldest messages and never blocks the broadcast to anyone else.
 
-8. Keep this file and the two `@`-referenced docs in sync when any of the above
+8. **Archive tier (system of record).** `backend/archive/writer.py` is a fourth
+   independent bus subscriber (`subscribe("archive")`, constraint #4). Every
+   CRC-valid reading is appended, at full resolution, forever, to
+   `archive/spool/node=<id>/<hour>.ndjson` (newline-delimited JSON; a crash costs
+   at most one truncated line). All file I/O, `fsync` included, runs on a
+   dedicated writer thread, never the event loop (constraint #3) -- the async
+   side does one `queue.Queue.put_nowait` per reading and nothing else.
+
+   A finished hour is gzip-compressed and stored under
+   `archive/data/readings/node_id=<id>/date=<date>/hour=<hour>/` via
+   `backend/archive/store.py`'s `ArchiveStore` seam (`put`/`exists`/
+   `get_bytes`/`uri`; `LocalStore` today, a cloud store later is one more
+   implementation with nothing else in the codebase changing). An hour can be
+   sealed more than once -- a restart force-closes whatever hour is open even if
+   unfinished -- so each seal is its own numbered part
+   (`part-0000.ndjson.gz`, `part-0001.ndjson.gz`, ...) and **never overwrites a
+   prior part**. The sidecar `_manifest.json` next to the data (never a row in
+   SQLite, so deleting the database can never destroy the record of what was
+   archived) aggregates `rows_written` / `drops_observed` / `complete` across
+   every part.
+
+   `complete: true` means **no loss observed by the backend** -- nothing
+   stronger is knowable; a frame lost over the air leaves only a `seq_num` gap
+   (protocol-spec section 6, unrecoverable here). A bus or internal-queue drop
+   writes a `_gap` record **into the spool file itself** (survives a crash that
+   would erase an in-memory counter); any hour containing one is
+   `complete: false` forever. `seq_gaps_observed` is tracked and restored across
+   restarts (`_recover_last_seq`) but deliberately does NOT clear `complete`
+   (usually RF loss, not backend fault).
+
+   **Not yet gating retention or the read path.** `db/retention.py` still
+   deletes on its existing timer; `scripts/verify_archive.py` reconciles the
+   archive against `readings` and verifies every manifest, so the archive can be
+   trusted before that gate is added (a deferred production step). Nothing in
+   `GET /readings` reads the archive yet -- it is write-only insurance for now,
+   and `READINGS_FULL_RES_HOURS` has deliberately NOT been lowered from 168 for
+   this reason.
+
+9. Keep this file and the two `@`-referenced docs in sync when any of the above
    changes, so future sessions don't have to be re-told.
