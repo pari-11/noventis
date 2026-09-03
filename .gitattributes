@@ -1,0 +1,4 @@
+# Git hooks are shell scripts and must keep LF endings even on Windows
+# (core.autocrlf=true would otherwise check them out as CRLF, and a `#!/bin/sh\r`
+# shebang fails with "bad interpreter" on any POSIX shell / WSL).
+.githooks/** text eol=lf
