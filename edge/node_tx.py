@@ -10,24 +10,26 @@ byte-for-byte identical to backend/ingest/protocol.py). See docs/protocol-spec.m
 Fixed-point scaling (accel * 100, gyro * 1000) now lives in
 `protocol.encode_tlv`; `protocol.build_frame` produces byte-identical frames to
 the previous inline construction (asserted by protocol.py's __main__ self-test).
+
+IMU note: this node's board reports WHO_AM_I 0x70 (MPU6500) at I2C address
+0x68 -- register-compatible with the MPU6050 for accel/gyro, just a different
+chip ID. adafruit_mpu6050's CircuitPython register descriptors hit a
+memoryview/int compatibility bug against this Pi's Blinka/PureIO versions, so
+the IMU is read directly over smbus2 instead (DirectMPU below), bypassing that
+dependency chain entirely.
 """
 
 import time
+import struct
 import serial
 import board
 import busio
+import smbus2
 import adafruit_vl53l0x
 import RPi.GPIO as GPIO
 
 # Shared TLV + CRC-16 codec (was inline in this file).
 from protocol import build_frame
-
-# Optional IMU import
-try:
-    import adafruit_mpu6050
-    IMU_DRIVER_AVAILABLE = True
-except ImportError:
-    IMU_DRIVER_AVAILABLE = False
 
 # --- Hardware Configuration ---
 UART_PORT = "/dev/serial0"
@@ -70,14 +72,46 @@ except Exception as e:
     vl53 = None
     print(f"[INIT] VL53L0X not available ({e}). Transmitting without ToF.")
 
-# 2. Attempt IMU Initialization (Graceful Fallback)
+# 2. Initialize IMU (direct SMBus driver -- works with 0x68/0x70/0x71/0x73:
+#    MPU6050/6500/9250/9255 all share this register layout for accel/gyro).
+class DirectMPU:
+    def __init__(self, bus_num=1, address=0x68):
+        self.address = address
+        self.bus = smbus2.SMBus(bus_num)
+        # Wake the sensor: clear SLEEP bit in PWR_MGMT_1 (0x6B).
+        self.bus.write_byte_data(self.address, 0x6B, 0x00)
+        # Force known ranges rather than trust power-on-reset defaults, since
+        # a register write from an earlier run could otherwise leave these on
+        # a different setting without the sensor reporting any error.
+        self.bus.write_byte_data(self.address, 0x1C, 0x00)  # ACCEL_CONFIG: +/-2g
+        self.bus.write_byte_data(self.address, 0x1B, 0x00)  # GYRO_CONFIG: +/-250 deg/s
+        time.sleep(0.05)
+
+    def read_motion(self):
+        # Burst read 14 bytes starting at ACCEL_XOUT_H (0x3B):
+        # 0x3B..0x40 Accel X,Y,Z | 0x41..0x42 Temp | 0x43..0x48 Gyro X,Y,Z
+        data = self.bus.read_i2c_block_data(self.address, 0x3B, 14)
+        raw = struct.unpack(">hhhhhhh", bytes(data))
+
+        # +/-2g range: 16384 LSB/g * 9.80665 m/s^2/g
+        ax = (raw[0] / 16384.0) * 9.80665
+        ay = (raw[1] / 16384.0) * 9.80665
+        az = (raw[2] / 16384.0) * 9.80665
+
+        # +/-250 deg/s range: 131.0 LSB/(deg/s), converted to rad/s
+        deg_to_rad = 3.141592653589793 / 180.0
+        gx = (raw[4] / 131.0) * deg_to_rad
+        gy = (raw[5] / 131.0) * deg_to_rad
+        gz = (raw[6] / 131.0) * deg_to_rad
+
+        return (ax, ay, az), (gx, gy, gz)
+
 imu = None
-if IMU_DRIVER_AVAILABLE:
-    try:
-        imu = adafruit_mpu6050.MPU6050(i2c, address=0x68)
-        print("[INIT] MPU-9250 IMU detected at 0x68.")
-    except Exception:
-        print("[INIT] MPU-9250 not detected. Running in ToF-only mode.")
+try:
+    imu = DirectMPU(bus_num=1, address=0x68)
+    print("[INIT] IMU (ID: 0x70) detected and initialized at 0x68.")
+except Exception as e:
+    print(f"[INIT] IMU not detected ({e}). Running in ToF-only mode.")
 
 ser = serial.Serial(UART_PORT, baudrate=BAUD_RATE, timeout=0.5)
 print(f"Node {NODE_ID} online. Broadcasting telemetry frames...\n")
@@ -88,6 +122,8 @@ try:
     while True:
         readings = {}
         distance_mm = None
+        accel_z = None
+        gyro_tuple = None
 
         # --- TLV Tag 0x01: ToF Sensor ---
         if vl53 is not None:
@@ -100,10 +136,10 @@ try:
         # --- TLV Tag 0x02: IMU 6-Axis (Accel + Gyro) ---
         if imu is not None:
             try:
-                accel_x, accel_y, accel_z = imu.acceleration  # m/s^2
-                gyro_x, gyro_y, gyro_z = imu.gyro  # rad/s
-                readings["accel_mss"] = (accel_x, accel_y, accel_z)
-                readings["gyro_rads"] = (gyro_x, gyro_y, gyro_z)
+                accel_tuple, gyro_tuple = imu.read_motion()
+                accel_z = accel_tuple[2]
+                readings["accel_mss"] = accel_tuple
+                readings["gyro_rads"] = gyro_tuple
             except Exception as e:
                 print(f"IMU Read Error: {e}")
 
@@ -119,8 +155,10 @@ try:
         log_str = f"TX Seq #{seq_num:05d} | Frame Len: {len(packet):02d}B | CRC: 0x{crc_val:04X}"
         if distance_mm is not None:
             log_str += f" | ToF: {distance_mm:4d} mm"
-        if imu is not None:
+        if accel_z is not None:
             log_str += f" | Accel-Z: {accel_z:5.2f} m/s²"
+        if gyro_tuple is not None:
+            log_str += f" | Gyro: ({gyro_tuple[0]:5.2f}, {gyro_tuple[1]:5.2f}, {gyro_tuple[2]:5.2f}) rad/s"
         print(log_str)
 
         seq_num = (seq_num + 1) & 0xFFFF

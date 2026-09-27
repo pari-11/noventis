@@ -27,7 +27,23 @@ The full pipeline is built and covered by integration tests
 
 - `edge/protocol.py` == `backend/ingest/protocol.py` -- TLV + CRC-16-CCITT codec
   for the shipped `0xAA55` frame format, plus `extract_frames` stream de-framer
-- `edge/node_tx.py` -- real production TX script, importing `protocol`
+- `edge/node_tx.py` -- real production TX script, importing `protocol`. IMU
+  (accel+gyro) is read via a hand-rolled `smbus2` driver (`DirectMPU`, register
+  I/O direct to the chip) rather than `adafruit_mpu6050` -- this Pi's board
+  reports `WHO_AM_I 0x70` (MPU6500, register-compatible with the MPU6050 for
+  accel/gyro), and `adafruit_mpu6050`'s CircuitPython register descriptors hit a
+  memoryview/int bug against this Pi's Blinka/PureIO versions. Deployed on the
+  edge Pi as the systemd service `noventis-tx.service` (`enabled`, auto-restarts
+  on exit/reboot) -- **check `systemctl status noventis-tx.service` /
+  `ps aux | grep node_tx` before assuming a terminal you started is the only
+  transmitter.** Two divergent copies of this file at different paths (one
+  systemd-managed, one hand-run from a separate checkout) silently interleaved
+  frames under the same `NODE_ID` here (found 2026-09-27) -- symptomatically:
+  ToF kept updating live no matter what the visible terminal did, IMU fields
+  stayed empty, because the stale systemd-managed copy predated IMU support and
+  only ever sent `tof_mm`. `docs/protocol-spec.md` §6 already documents that the
+  backend cannot tell two same-`NODE_ID` transmitters apart. Keep exactly one
+  deployed copy of this file in sync with the repo.
 - `backend/legacy/base_rx.py` -- original standalone receiver, kept as the
   decoder reference (NOT imported by the app)
 - `backend/ingest/serial_reader.py` -- CP2102 autodetect by USB VID:PID
