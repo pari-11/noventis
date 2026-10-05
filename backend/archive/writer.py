@@ -347,8 +347,8 @@ class ArchiveWriter:
         log.info("archive writer subscribed to event bus (dir=%s, store=%r)",
                  self._dir, self._store)
         async for event in self._bus.subscribe("archive"):
-            if not event.get("crc_ok"):
-                continue
+            if not event.get("crc_ok") or event.get("control"):
+                continue    # CRC failures and control frames (ACKs) are not readings
             try:
                 # Did the BUS drop anything for us since last time? If so the
                 # hole is already in the past; record it before the next row so

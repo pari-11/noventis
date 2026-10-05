@@ -31,6 +31,8 @@ Routes:
   GET  /raw-frames?node_id=...     -- api/raw_frames.py (CRC-failed frames only now)
   GET  /debug/frames               -- api/debug.py (in-memory ring buffer window)
   WS   /live?node_id=...           -- ws/manager.py (omit node_id for all nodes)
+  WS   /live/raw?node_id=...       -- ws/raw_manager.py (every candidate frame as hex)
+  POST /nodes/{id}/shutdown        -- api/power.py (LoRa shutdown command, waits for the outcome)
 
 Only ingest/serial_reader.py touches pyserial; every other component sees the
 in-process event bus.
@@ -48,8 +50,9 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 
-from .api import debug, nodes, raw_frames, readings
+from .api import debug, nodes, power, raw_frames, readings
 from .archive.writer import ArchiveWriter
+from .control.shutdown import ShutdownController
 from .db.models import Node
 from .db.retention import RetentionJob
 from .db.session import SessionLocal, dispose, init_db
@@ -62,6 +65,7 @@ from .ingest.serial_reader import (
     node_port_map_from_env,
 )
 from .ws.manager import ConnectionManager
+from .ws.raw_manager import RawConnectionManager
 
 logging.basicConfig(
     level=os.getenv("NOVENTIS_LOG_LEVEL", "INFO"),
@@ -88,10 +92,14 @@ async def lifespan(app: FastAPI):
     writer = DBWriter(bus)
     ws_manager = ConnectionManager(bus)
     frame_buffer = FrameRingBuffer(bus)
+    raw_ws_manager = RawConnectionManager(bus)
+    control = ShutdownController(bus, lambda: app.state.reader)
     archive = ArchiveWriter(bus)
     writer.start()
     ws_manager.start()
     frame_buffer.start()
+    raw_ws_manager.start()   # independent subscriber; /live/raw only
+    control.start()          # independent subscriber; remote shutdown (acks + telemetry age)
     archive.start()          # MUST be here, with the other subscribers...
     await asyncio.sleep(0)   # ...i.e. before this, or it silently misses the first frames
 
@@ -108,6 +116,8 @@ async def lifespan(app: FastAPI):
     app.state.archive = archive
     app.state.writer = writer
     app.state.ws_manager = ws_manager
+    app.state.raw_ws_manager = raw_ws_manager
+    app.state.control = control
     app.state.frame_buffer = frame_buffer
     app.state.retention = retention
     log.info("noventis backend started (CORS origins: %s)", CORS_ORIGINS or "none")
@@ -122,6 +132,8 @@ async def lifespan(app: FastAPI):
         await archive.stop()
         await retention.stop()
         await frame_buffer.stop()
+        await control.stop()
+        await raw_ws_manager.stop()
         await ws_manager.stop()
         await writer.stop()
         await dispose()
@@ -140,6 +152,7 @@ app.include_router(nodes.router)
 app.include_router(readings.router)
 app.include_router(raw_frames.router)
 app.include_router(debug.router)
+app.include_router(power.router)
 
 
 @app.get("/health", tags=["meta"])
@@ -163,6 +176,8 @@ async def health() -> dict:
         "nodes_seen": nodes_seen,
         "writer": app.state.writer.status(),
         "ws": app.state.ws_manager.status(),
+        "ws_raw": app.state.raw_ws_manager.status(),
+        "control": app.state.control.status(),
         "bus": bus.status(),
         "frame_buffer": app.state.frame_buffer.status(),
         "archive": app.state.archive.status(),
@@ -218,3 +233,8 @@ async def rescan_ports() -> dict:
 @app.websocket("/live")
 async def live(websocket: WebSocket, node_id: int | None = None) -> None:
     await app.state.ws_manager.serve(websocket, node_id)
+
+
+@app.websocket("/live/raw")
+async def live_raw(websocket: WebSocket, node_id: int | None = None) -> None:
+    await app.state.raw_ws_manager.serve(websocket, node_id)

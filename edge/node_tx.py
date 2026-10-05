@@ -19,6 +19,8 @@ the IMU is read directly over smbus2 instead (DirectMPU below), bypassing that
 dependency chain entirely.
 """
 
+import os
+import subprocess
 import time
 import struct
 import serial
@@ -29,7 +31,10 @@ import adafruit_vl53l0x
 import RPi.GPIO as GPIO
 
 # Shared TLV + CRC-16 codec (was inline in this file).
-from protocol import build_frame
+from protocol import (
+    ACTION_SHUTDOWN, ProtocolError, build_ack_frame, build_frame,
+    extract_frames, parse_frame, verify_command,
+)
 
 # --- Hardware Configuration ---
 UART_PORT = "/dev/serial0"
@@ -118,6 +123,126 @@ print(f"Node {NODE_ID} online. Broadcasting telemetry frames...\n")
 
 seq_num = 0
 
+# --- Remote shutdown command (docs/protocol-spec.md section 8) ----------------
+# Added AFTER the original sensor/transmit logic and does not change it: the only
+# edit to the loop is that its closing time.sleep(0.5) became idle_and_listen(0.5),
+# which waits the same 0.5 s but checks the radio for a command in between.
+#
+# The base station can send an authenticated "shut down" frame. It is acted on
+# only if (1) its HMAC matches the secret in SECRET_FILE, (2) it is addressed to
+# this NODE_ID, and (3) its counter is higher than the last one accepted
+# (COUNTER_FILE) so a recorded command can never be replayed. Without a secret
+# file the feature is simply off and telemetry is unaffected. Neither file is in
+# git (see .gitignore).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SECRET_FILE = os.getenv("NOVENTIS_CMD_SECRET_FILE", os.path.join(_HERE, ".cmd_secret"))
+COUNTER_FILE = os.getenv("NOVENTIS_CMD_COUNTER_FILE", os.path.join(_HERE, ".cmd_counter"))
+ACK_REPEATS = 3          # the ACK is repeated: the radio is half duplex and one may be lost
+ACK_GAP_S = 0.3
+POWEROFF_DELAY_S = 2.0   # let the last ACK leave the radio before power drops
+
+
+def _load_secret():
+    try:
+        with open(SECRET_FILE, "rb") as f:
+            secret = f.read().strip()
+        return secret if len(secret) >= 8 else None
+    except OSError:
+        return None
+
+
+def _load_counter():
+    try:
+        with open(COUNTER_FILE) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _save_counter(value):
+    tmp = COUNTER_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(value))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, COUNTER_FILE)
+
+
+def _can_poweroff():
+    """Root, or passwordless sudo -- checked BEFORE acknowledging, so we never
+    tell the base 'shutting down' and then fail to."""
+    return os.geteuid() == 0 or subprocess.call(["sudo", "-n", "true"]) == 0
+
+
+cmd_secret = _load_secret()
+last_cmd_counter = _load_counter()
+cmd_rx = bytearray()
+print("[INIT] Remote shutdown " + ("enabled." if cmd_secret else "disabled (no secret file)."))
+
+
+def _handle_command(cmd):
+    global last_cmd_counter
+    if cmd["node_id"] != NODE_ID or cmd["action"] != ACTION_SHUTDOWN:
+        return
+    if not verify_command(cmd_secret, cmd):
+        print("[CMD] shutdown rejected: bad authentication code")
+        return
+    if cmd["counter"] <= last_cmd_counter:
+        print("[CMD] shutdown rejected: stale counter (replay?)")
+        return
+    if not _can_poweroff():
+        print("[CMD] shutdown command valid but this user cannot power off (needs root or passwordless sudo)")
+        return
+    last_cmd_counter = cmd["counter"]
+    _save_counter(last_cmd_counter)          # persist BEFORE acting
+    print(f"[CMD] valid shutdown command (counter {last_cmd_counter}) -- acknowledging")
+    ack = build_ack_frame(NODE_ID, (seq_num - 1) & 0xFFFF, cmd["action"], cmd["counter"])
+    for _ in range(ACK_REPEATS):
+        wait_for_radio_idle()
+        ser.write(ack)
+        ser.flush()
+        time.sleep(ACK_GAP_S)
+    time.sleep(POWEROFF_DELAY_S)
+    argv = ["systemctl", "poweroff"] if os.geteuid() == 0 else ["sudo", "-n", "systemctl", "poweroff"]
+    subprocess.call(argv)
+
+
+def poll_command():
+    """Drain the radio's receive buffer; act on a valid shutdown command. Never
+    raises -- a fault here must not stop telemetry."""
+    try:
+        waiting = ser.in_waiting
+        if waiting:
+            chunk = ser.read(waiting)
+            if cmd_secret is None:
+                return                       # feature off: just keep the buffer empty
+            cmd_rx.extend(chunk)
+            if len(cmd_rx) > 1024:
+                del cmd_rx[:-512]
+        if cmd_secret is None:
+            return
+        for frame in extract_frames(cmd_rx):
+            try:
+                decoded = parse_frame(frame)
+            except ProtocolError:
+                continue
+            if decoded.crc_ok and "cmd" in decoded.values:
+                _handle_command(decoded.values["cmd"])
+    except Exception as e:
+        print(f"[CMD] listener error: {e}")
+
+
+def idle_and_listen(duration, step=0.05):
+    """Same wait as time.sleep(duration), but checks for a command every `step`."""
+    end = time.time() + duration
+    while True:
+        poll_command()
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(step, remaining))
+
+
 try:
     while True:
         readings = {}
@@ -162,7 +287,7 @@ try:
         print(log_str)
 
         seq_num = (seq_num + 1) & 0xFFFF
-        time.sleep(0.5)
+        idle_and_listen(0.5)   # was time.sleep(0.5); same 0.5 s, but listens for a command
 
 except KeyboardInterrupt:
     print("\nTransmission stopped by user.")

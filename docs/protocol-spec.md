@@ -110,6 +110,8 @@ TAG (1 byte) | LEN (1 byte) | VALUE (LEN bytes)
 |--------|----------------|-----|-----------------------------------------|------------------------------------------|
 | `0x01` | `TAG_TOF`      | 2   | `uint16`                                | ToF distance, millimetres                |
 | `0x02` | `TAG_IMU_6AXIS`| 12  | `6 x int16` = `ax, ay, az, gx, gy, gz`  | accelerometer + gyroscope, fixed-point   |
+| `0x10` | `TAG_CMD`      | 14  | `u8 node_id, u8 action, u32 counter, 8-byte mac` | **control**, base -> node (section 8) |
+| `0x11` | `TAG_CMD_ACK`  | 5   | `u8 action, u32 counter`                | **control**, node -> base (section 8)    |
 
 ### Fixed-point scaling (tag `0x02`)
 
@@ -133,6 +135,8 @@ These key names are used everywhere downstream — on the event bus, in the
 | `tof_out_of_range` | bool              | `TAG_TOF`      | —       |
 | `accel_mss`        | `[x, y, z]` float | `TAG_IMU_6AXIS`| m/s^2   |
 | `gyro_rads`        | `[x, y, z]` float | `TAG_IMU_6AXIS`| rad/s   |
+| `cmd`              | dict `{node_id, action, counter, mac}` | `TAG_CMD` | control, section 8 |
+| `cmd_ack`          | dict `{action, counter}` | `TAG_CMD_ACK` | control, section 8 |
 
 `accel_mss` and `gyro_rads` always appear together (one `0x02` record carries
 both). When encoding, if only one is supplied the other is packed as zeros.
@@ -219,3 +223,74 @@ output is byte-identical to the original inline construction.
 | 1       | 2026-08-30 | Initial spec — documents the shipped `0xAA55` frame format.  |
 | 2       | 2026-08-31 | §3: document the derived `tof_out_of_range` key (backend-side, not on the wire; codec and both `protocol.py` modules unchanged). |
 | 3       | 2026-09-01 | §1/§6: document the `NODE_ID` (firmware-fixed, routing key) vs. node `name` (cosmetic label) invariant and that firmware `NODE_ID` collisions are not detected. Docs only — no wire or behaviour change. |
+| 4       | 2026-10-05 | §3 + new §8: control tags `0x10` (command, base -> node) and `0x11` (acknowledgement, node -> base) for remote node shutdown over LoRa, authenticated with a truncated HMAC-SHA256 and a replay counter. Telemetry tags and framing unchanged; older decoders skip the new tags. |
+
+---
+
+## 8. Control frames: remote shutdown (base -> node)
+
+Control frames use the **same framing, CRC and node addressing** as telemetry
+(section 1). They carry no sensor data and every consumer must keep them out of
+readings, charts and the archive (the backend marks them `control: true`; they
+remain visible in the raw packet view).
+
+### 8.1 Command (`TAG_CMD` 0x10, base -> node)
+
+```
+TAG 0x10 | LEN 14 | node_id u8 | action u8 | counter u32 (big-endian) | mac 8 bytes
+```
+
+- Frame header `NODE_ID` = the target node, `SEQ_NUM` = 0 (the base has no
+  telemetry sequence). `node_id` in the record is the target again and is what is
+  authenticated.
+- `action`: `0x01` = shut down (power off safely). No other actions are defined.
+- `mac` = first 8 bytes of **HMAC-SHA256(secret, node_id | action | counter)**, the
+  three fields packed as `>BBI` (6 bytes). `secret` is a shared string (>= 8
+  characters) configured on both sides and never sent over the air.
+- `counter` must be **strictly greater** than the last counter the node accepted
+  (the node persists it, so this survives reboots). The backend uses wall-clock
+  seconds, so the sequence only ever increases and no state file is needed on the
+  base. Retries of one request reuse the same counter.
+
+A node acts on a command only if all of: CRC valid; `node_id` is its own; `action`
+is known; `mac` verifies; `counter` is newer. Anything else is silently ignored.
+
+### 8.2 Acknowledgement (`TAG_CMD_ACK` 0x11, node -> base)
+
+```
+TAG 0x11 | LEN 5 | action u8 | counter u32
+```
+
+Sent as an ordinary frame with the node's `NODE_ID` and its **last telemetry
+`SEQ_NUM`** (so no gap appears in the telemetry sequence). Sent 3 times, ~0.3 s
+apart (the radio is half duplex and one may be lost), then the node waits ~2 s so
+the last copy leaves the radio, then powers off. The node checks it *can* power
+off before acknowledging.
+
+### 8.3 Timing (stop-and-wait)
+
+The radio cannot receive while it transmits, in either direction, so the base does
+not blast the command: it sends once, stays quiet ~1 s to listen for the ACK, and
+repeats for ~10 s. The node listens in 50 ms steps inside its normal 0.5 s idle
+period between telemetry frames.
+
+### 8.4 Outcomes the base can report
+
+| outcome | meaning |
+|---|---|
+| `acked` | the node confirmed; it is powering off |
+| `silent` | no ACK, and no telemetry from the node for ~3 s -- probably off, unconfirmed (may also have been off / out of range already) |
+| `not_received` | no ACK and the node is still transmitting -- the command did not get through |
+
+### 8.5 Security properties and limits
+
+- **Authenticated, not encrypted.** A device without the secret cannot make a
+  valid command, and a recorded command cannot be replayed (stale counter).
+  Anyone can still *read* the traffic.
+- The **ACK is not authenticated** (it only drives a status message; spoofing it
+  cannot shut anything down).
+- 8-byte MAC = 64 bits: ample against guessing at LoRa speeds.
+- If the base's clock is ever set far into the future, commands issued afterwards
+  are refused until real time catches up with the last accepted counter. Recovery:
+  delete the node's counter file.
+- A powered-off Pi cannot be restarted remotely; power must be re-applied.

@@ -21,6 +21,8 @@ import { NodeSelector, type NodeInfo } from './components/NodeSelector'
 import { LiveChart } from './components/LiveChart'
 import { HistoryPanel } from './components/HistoryPanel'
 import { NodeSummaryCard } from './components/NodeSummaryCard'
+import { RawDataPage } from './components/RawDataPage'
+import { NodePowerControl } from './components/NodePowerControl'
 
 type Health = {
   status: string
@@ -64,6 +66,22 @@ export default function App() {
   const [healthErr, setHealthErr] = useState<string | null>(null)
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [now, setNow] = useState(() => Date.now())
+
+  // "View Raw data" is a hash route (#/raw) -- no router dependency, and the
+  // browser Back button returns to the dashboard. The dashboard stays MOUNTED
+  // (just hidden) while it's open, so its /live connection is left untouched.
+  const [rawView, setRawView] = useState(() => window.location.hash === '#/raw')
+  useEffect(() => {
+    const onHash = () => setRawView(window.location.hash === '#/raw')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  // Once opened, the raw page stays mounted (hidden when you go back) so its
+  // stream and buffered packets survive a trip to the dashboard and back.
+  const [rawOpened, setRawOpened] = useState(rawView)
+  useEffect(() => {
+    if (rawView) setRawOpened(true)
+  }, [rawView])
 
   const [theme, setTheme] = useState<'light' | 'dark'>(
     () => (localStorage.getItem('noventis-theme') === 'light' ? 'light' : 'dark'),
@@ -191,6 +209,16 @@ export default function App() {
           </button>
         </div>
         <button
+          className="btn raw-nav-btn"
+          onClick={() => {
+            if (rawView) setNodeId(null) // "← Dashboard" lands on the All nodes tab
+            window.location.hash = rawView ? '' : '#/raw'
+          }}
+          title={rawView ? 'Back to the dashboard' : 'See every packet exactly as received, in hex'}
+        >
+          {rawView ? '← Dashboard' : 'View Raw data'}
+        </button>
+        <button
           className="btn icon-btn"
           onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
           title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
@@ -200,7 +228,15 @@ export default function App() {
         </button>
       </header>
 
+      {rawOpened && (
+        <div hidden={!rawView}>
+          <RawDataPage initialNodeId={nodeId} />
+        </div>
+      )}
+
+      <div hidden={rawView}>
       <NodeSelector value={nodeId} onChange={setNodeId} />
+      {nodeId != null && <NodePowerControl key={nodeId} nodeId={nodeId} nodeName={selectedName} />}
 
       {nodeId == null ? (
         <main>
@@ -221,6 +257,7 @@ export default function App() {
           <HistoryPanel nodeId={nodeId} nodeName={selectedName} />
         </main>
       )}
+      </div>
     </div>
   )
 }

@@ -218,8 +218,8 @@ class ConnectionManager:
     async def _run(self) -> None:
         log.info("ws manager subscribed to event bus")
         async for event in self._bus.subscribe("ws-manager"):
-            if not event.get("crc_ok"):
-                continue
+            if not event.get("crc_ok") or event.get("control"):
+                continue    # control frames (ACKs) are not readings; never charted
             await self._broadcast(event)
             # Yield so the per-connection send tasks can drain. `_broadcast` is
             # pure `put_nowait` and `queue.get()` returns without suspending when

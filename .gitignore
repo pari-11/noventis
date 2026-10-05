@@ -35,3 +35,8 @@ ds-bundle/
 # Leading slash anchors to the repo root -- a bare `archive/` also matches
 # backend/archive/, which is SOURCE and must be committed.
 /archive/
+
+# Remote shutdown secret + replay counter (edge/node_tx.py) -- never commit
+edge/.cmd_secret
+edge/.cmd_counter
+edge/.cmd_counter.tmp

@@ -40,13 +40,21 @@ Published event shape (see also ingest/event_bus.py)::
                                    #   "tof_out_of_range" is added (see
                                    #   TOF_MAX_VALID_MM below).
       "received_at": datetime,     # timezone-aware UTC, stamped on receipt
+      "control":     bool,         # True for a CRC-valid control frame (shutdown
+                                   #   ACK, protocol-spec section 8). NOT telemetry:
+                                   #   db.writer / archive.writer / ws.manager skip
+                                   #   it; frame_buffer and /live/raw still see it.
     }
+
+Outbound: ``send(bytes)`` queues bytes for THIS thread to write to the port
+(the port belongs to this thread alone; callers never write to it directly).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -180,6 +188,10 @@ class SerialReader:
         self._frames_ok = 0
         self._frames_bad = 0
         self._last_error: str | None = None
+        # bytes queued by send() for this thread to write; bounded so a stuck
+        # port can't accumulate commands without limit
+        self._outbox: queue.Queue = queue.Queue(maxsize=32)
+        self._frames_sent = 0
 
     # -- lifecycle (call from the asyncio side) ----------------------------- #
     def start(self):
@@ -208,6 +220,20 @@ class SerialReader:
         log.info("serial reader: rescan requested")
         self._rescan.set()
 
+    def send(self, data: bytes) -> bool:
+        """Queue ``data`` to be written to the radio. Safe from any thread; never
+        blocks. Returns False when no port is open or the outbox is full.
+
+        The reader thread does the actual write within one read timeout (~0.2 s).
+        """
+        if not self.connected:
+            return False
+        try:
+            self._outbox.put_nowait(bytes(data))
+            return True
+        except queue.Full:
+            return False
+
     def _sleep(self, seconds: float):
         """Wait up to ``seconds``, returning early on stop or a rescan request."""
         end = time.monotonic() + seconds
@@ -228,6 +254,7 @@ class SerialReader:
             "bytes_read": self._bytes_read,
             "frames_ok": self._frames_ok,
             "frames_bad": self._frames_bad,
+            "frames_sent": self._frames_sent,
             "last_error": self._last_error,
         }
 
@@ -267,6 +294,11 @@ class SerialReader:
             timeout=READ_TIMEOUT_S,
         ) as ser:
             ser.reset_input_buffer()
+            while True:                     # drop commands queued for a previous port
+                try:
+                    self._outbox.get_nowait()
+                except queue.Empty:
+                    break
             self._port = device
             self._last_error = None
             log.info("LoRa base station connected on %s", device)
@@ -274,6 +306,7 @@ class SerialReader:
             buf = bytearray()
             idle_ticks = 0
             while not self._stop.is_set() and not self._rescan.is_set():
+                self._flush_outbox(ser)
                 waiting = ser.in_waiting
                 chunk = ser.read(waiting or 1)  # returns within READ_TIMEOUT_S when idle
                 if not chunk:
@@ -293,6 +326,18 @@ class SerialReader:
                 for frame in extract_frames(buf):
                     self._handle_frame(frame)
         log.info("closed LoRa serial port %s", device)
+
+    def _flush_outbox(self, ser):
+        """Write anything queued by send(). Runs on the reader thread only."""
+        while True:
+            try:
+                data = self._outbox.get_nowait()
+            except queue.Empty:
+                return
+            ser.write(data)
+            ser.flush()
+            self._frames_sent += 1
+            log.info("%s: sent %d bytes to radio: %s", self._port, len(data), data.hex())
 
     def _handle_frame(self, frame: bytes):
         received_at = datetime.now(timezone.utc)
@@ -329,6 +374,7 @@ class SerialReader:
             "raw_hex": raw.hex(),
             "values": values,
             "received_at": received_at,
+            "control": bool(crc_ok and ("cmd" in values or "cmd_ack" in values)),
         })
 
 
