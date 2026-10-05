@@ -21,6 +21,8 @@ import { NodeSelector, type NodeInfo } from './components/NodeSelector'
 import { LiveChart } from './components/LiveChart'
 import { HistoryPanel } from './components/HistoryPanel'
 import { NodeSummaryCard } from './components/NodeSummaryCard'
+import { RawDataPage } from './components/RawDataPage'
+import { NodePowerControl } from './components/NodePowerControl'
 
 type Health = {
   status: string
@@ -64,6 +66,26 @@ export default function App() {
   const [healthErr, setHealthErr] = useState<string | null>(null)
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [now, setNow] = useState(() => Date.now())
+  // node_id -> when the operator acknowledged its shutdown (ms). While set, that
+  // node's graphs are replaced by an "unreachable, please replug" card. Cleared as
+  // soon as the node transmits again (effect below), so it can never get stuck.
+  const [poweredOff, setPoweredOff] = useState<Record<number, number>>({})
+
+  // "View Raw data" is a hash route (#/raw) -- no router dependency, and the
+  // browser Back button returns to the dashboard. The dashboard stays MOUNTED
+  // (just hidden) while it's open, so its /live connection is left untouched.
+  const [rawView, setRawView] = useState(() => window.location.hash === '#/raw')
+  useEffect(() => {
+    const onHash = () => setRawView(window.location.hash === '#/raw')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  // Once opened, the raw page stays mounted (hidden when you go back) so its
+  // stream and buffered packets survive a trip to the dashboard and back.
+  const [rawOpened, setRawOpened] = useState(rawView)
+  useEffect(() => {
+    if (rawView) setRawOpened(true)
+  }, [rawView])
 
   const [theme, setTheme] = useState<'light' | 'dark'>(
     () => (localStorage.getItem('noventis-theme') === 'light' ? 'light' : 'dark'),
@@ -139,6 +161,19 @@ export default function App() {
   }, [nodeId])
 
   useEffect(() => {
+    setPoweredOff((prev) => {
+      const back = Object.keys(prev).filter((k) => {
+        const n = nodes.find((x) => x.node_id === Number(k))
+        return n != null && new Date(n.last_seen).getTime() > prev[Number(k)]
+      })
+      if (back.length === 0) return prev
+      const next = { ...prev }
+      for (const k of back) delete next[Number(k)]
+      return next
+    })
+  }, [nodes])
+
+  useEffect(() => {
     if (nodeId != null) return
     const id = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(id)
@@ -191,6 +226,16 @@ export default function App() {
           </button>
         </div>
         <button
+          className="btn raw-nav-btn"
+          onClick={() => {
+            if (rawView) setNodeId(null) // "← Dashboard" lands on the All nodes tab
+            window.location.hash = rawView ? '' : '#/raw'
+          }}
+          title={rawView ? 'Back to the dashboard' : 'See every packet exactly as received, in hex'}
+        >
+          {rawView ? '← Dashboard' : 'View Raw data'}
+        </button>
+        <button
           className="btn icon-btn"
           onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
           title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
@@ -200,7 +245,22 @@ export default function App() {
         </button>
       </header>
 
+      {rawOpened && (
+        <div hidden={!rawView}>
+          <RawDataPage initialNodeId={nodeId} />
+        </div>
+      )}
+
+      <div hidden={rawView}>
       <NodeSelector value={nodeId} onChange={setNodeId} />
+      {nodeId != null && poweredOff[nodeId] == null && (
+        <NodePowerControl
+          key={nodeId}
+          nodeId={nodeId}
+          nodeName={selectedName}
+          onPoweredOff={(id) => setPoweredOff((p) => ({ ...p, [id]: Date.now() }))}
+        />
+      )}
 
       {nodeId == null ? (
         <main>
@@ -215,12 +275,21 @@ export default function App() {
             </div>
           )}
         </main>
+      ) : poweredOff[nodeId] != null ? (
+        <main>
+          <section className="card powered-off">
+            <h2>{selectedName ?? `Node ${nodeId}`} is unreachable</h2>
+            <p>Please unplug the Pi's power and plug it back in to start it again.</p>
+            <p className="muted small">This clears by itself as soon as the node starts transmitting.</p>
+          </section>
+        </main>
       ) : (
         <main className="grid">
           <LiveChart key={nodeId} nodeId={nodeId} nodeName={selectedName} />
           <HistoryPanel nodeId={nodeId} nodeName={selectedName} />
         </main>
       )}
+      </div>
     </div>
   )
 }

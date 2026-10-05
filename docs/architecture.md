@@ -38,6 +38,9 @@ dashboard shows live and historical data.
   bounded outbox + send task -- one slow client drops only its own oldest
   messages (told via a `{"type":"gap"}` control message) and can never block
   the broadcast to anyone else.
+- `ws/raw_manager.py` -- **event-bus subscriber** (`"ws-raw"`), serving `WS /live/raw`:
+  every candidate frame (CRC pass and fail) as hex, for the dashboard's raw-packet
+  view. Fully independent of `ws/manager.py` / `/live` (own registry + outboxes).
 - `archive/writer.py`, `archive/store.py` -- **event-bus subscriber** (the
   fourth, alongside the three above). System of record: every CRC-valid
   reading, full resolution, forever, in `archive/` -- see "Archive tier" below.
@@ -47,6 +50,10 @@ dashboard shows live and historical data.
   deletes the originals, and runs `PRAGMA incremental_vacuum`. Single tier. Its
   one-time `_prepare` step only converts the vacuum mode -- it never deletes.
 - `db/models.py`, `db/session.py` -- SQLAlchemy 2.0 async ORM over SQLite (WAL).
+- `control/shutdown.py`, `api/power.py` -- **event-bus subscriber** (`"control"`) and
+  its REST endpoint `POST /nodes/{id}/shutdown`: remote node shutdown over LoRa
+  (see "Remote shutdown" below). Writes to the radio only through
+  `ingest/serial_reader.py`'s `SerialReader.send()` outbox.
 - `api/nodes.py`, `api/readings.py`, `api/raw_frames.py`, `api/debug.py` -- REST routers.
 - `scripts/backup_db.py` -- consistent snapshot (`VACUUM INTO`) safe to run with
   the backend live. `scripts/migrate_purge_legacy_frames.py` -- deliberate,
@@ -167,6 +174,41 @@ until the archive has proven itself. `GET /readings` does not read the archive
 either; it is write-only insurance for now. Both are the deferred next steps,
 along with a cloud `ArchiveStore` implementation.
 
+## Remote shutdown (LoRa downlink)
+
+The dashboard's **Shut down node** button replaces "ssh in, run `sudo poweroff`".
+No Wi-Fi/SSH is involved -- the command rides the same LoRa link as telemetry,
+in the other direction (both ends are E22 modules in transparent mode, so bytes
+written to the gateway's serial port are transmitted).
+
+```
+button -> POST /nodes/{id}/shutdown -> ShutdownController
+   -> SerialReader.send(frame)   (outbox; the reader thread writes it)
+   -> LoRa -> node_tx.py poll_command(): CRC, node_id, HMAC, counter all valid?
+        -> sends ACK x3 (last telemetry seq) -> waits 2 s -> systemctl poweroff
+   <- ACK frame -> serial_reader (control: true) -> bus -> ShutdownController -> HTTP reply
+```
+
+Authentication, counter rules, timing and outcomes: protocol-spec section 8. The
+ACK is a normal CRC-valid frame, so `db.writer` / `archive.writer` / `ws.manager`
+skip frames flagged `control` before doing anything else; `frame_buffer` and
+`/live/raw` keep them (visible on the raw page).
+
+**Setup.** Backend: set `NOVENTIS_CMD_SECRET` (>= 8 chars). Pi: copy the updated
+`edge/node_tx.py` and `edge/protocol.py` (the Pi runs its own copy -- keep exactly
+one deployed, see CLAUDE.md), write the SAME secret to `.cmd_secret` beside
+`node_tx.py` (`printf '%s' 'the-secret' > .cmd_secret; chmod 600 .cmd_secret`), and
+`sudo systemctl restart noventis-tx.service`. The node powers off via
+`systemctl poweroff` (directly if the service runs as root, otherwise
+`sudo -n`, which needs passwordless sudo -- the Raspberry Pi OS default user has
+it; the node checks this *before* acknowledging). Neither `.cmd_secret` nor
+`.cmd_counter` is in git.
+
+**Limits.** A powered-off Pi cannot be restarted remotely -- power must be
+re-applied. `silent` is not proof of shutdown. Clock caveat and replay details:
+protocol-spec 8.5. A restart/reboot action is deliberately not built (the command
+format has an `action` byte, so it can be added without a wire change).
+
 ## Data model
 
 | Table        | Purpose                        | Key columns                                                   | Constraints |
@@ -274,7 +316,9 @@ writer + API readers). No Alembic yet -- `Base.metadata.create_all` at startup.
 | GET    | `/raw-frames?node_id=<id>`  | `raw_frames` table -- CRC-failed frames only now; `node_id` optional (NULL for bad header) |
 | GET    | `/debug/frames`             | window onto the in-memory frame ring buffer (recent frames, CRC pass + fail); `limit`, `crc_ok`, `node_id` filters; empty after a restart |
 | PATCH  | `/nodes/{node_id}`          | set display name; body `{"name": "<1..64 chars>"}`; returns the updated node (404 unknown node, 422 blank name) |
+| POST   | `/nodes/{node_id}/shutdown` | body `{"confirm": true}`; sends the authenticated LoRa shutdown command and waits ~10 s for the outcome `{node_id, outcome: acked\|silent\|not_received, attempts, message}`; 409 secret unset / radio down, 404 unknown node, 422 no confirm |
 | POST   | `/rescan`                   | force serial CP2102 auto-detect to re-run; waits a bounded window and returns `{ok, connected, port, last_error}` |
+| WS     | `/live/raw?node_id=<id>`    | raw packets as `{seq,node_id,seq_num,ts,crc_ok,raw_hex}`, CRC pass + fail; optional node filter; control msgs `ready`/`gap`; max `MAX_RAW_WS_CONNECTIONS` (default 8). Independent of `/live` |
 | WS     | `/live?node_id=<id>`        | data message carries no `type` (`{node_id, seq_num, ts, values}`, `ts` ISO-8601); control messages do and unrecognised ones must be ignored: `{"type":"ready","node_id":…}` on connect, `{"type":"gap","dropped":n}` when this client's own outbox overflowed, `{"type":"ping","ts":…}` liveness to an idle client only; omit `node_id` for all nodes; beyond `MAX_WS_CONNECTIONS` (default 32) a new connection is refused with close code 1013 |
 
 `GET /health` additionally reports `frame_buffer` (ring `size`/`capacity`/

@@ -59,6 +59,21 @@ The full pipeline is built and covered by integration tests
 - `backend/ws/manager.py` -- `/live` connection registry; per-connection outbox
   + send task (one slow client can never stall the others); `{"type":"gap"}` /
   `{"type":"ping"}` control messages alongside the unchanged data-frame contract
+- `backend/ws/raw_manager.py` -- `/live/raw`: separate sibling of `ws/manager.py` (own
+  `subscribe("ws-raw")`, own registry/outboxes, shares nothing with `/live`). Relays
+  EVERY candidate frame (CRC pass+fail) as `{seq,node_id,seq_num,ts,crc_ok,raw_hex}`;
+  feeds the dashboard's "View Raw data" page (`#/raw`, `RawDataPage.tsx`)
+- `backend/control/shutdown.py` + `backend/api/power.py` -- **remote node shutdown over
+  LoRa** (dashboard "Shut down node" button, `POST /nodes/{id}/shutdown`). An
+  independent bus subscriber (`subscribe("control")`); sends an authenticated command
+  (protocol-spec section 8: HMAC + replay counter) via `SerialReader.send()` (a
+  thread-safe outbox the reader thread writes from -- nothing else touches the port),
+  retries stop-and-wait for ~10 s, and returns `acked` / `silent` / `not_received`.
+  Needs `NOVENTIS_CMD_SECRET` (>= 8 chars) on the backend, else 409.
+  **Control frames** (the node's ACK) arrive on the bus with `control: true`;
+  `db.writer`, `archive.writer` and `ws.manager` skip them FIRST THING (an ACK's
+  `values` is non-empty and would otherwise be stored as a reading) while
+  `frame_buffer` and `/live/raw` still show them.
 - `backend/archive/writer.py` -- fourth independent bus subscriber; append-only
   archive, full resolution, forever (see constraint #8)
 - `backend/archive/store.py` -- `ArchiveStore` seam (`LocalStore` today; a cloud
@@ -86,7 +101,14 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
 
 1. **`edge/node_tx.py` is production code.** Do **not** rewrite its sensor-read
    or LoRa-transmit logic. The TLV encoding + CRC-16 have already been pulled out
-   into `edge/protocol.py` and are imported; keep it that way.
+   into `edge/protocol.py` and are imported; keep it that way. **One approved
+   exception (2026-10-05):** an additive remote-shutdown listener (`poll_command` /
+   `idle_and_listen`; the loop's closing `time.sleep(0.5)` became
+   `idle_and_listen(0.5)`, same 0.5 s). Sensor reads and the frame transmit are
+   untouched. It is OFF unless `edge/.cmd_secret` exists beside the script, and a
+   fault in it can never stop telemetry. **The Pi runs its own copy**: after editing
+   `node_tx.py` / `protocol.py` they must be copied to the Pi and
+   `noventis-tx.service` restarted (see docs/architecture.md "Remote shutdown").
 
 2. **Two protocol modules, one spec.** `edge/protocol.py` and
    `backend/ingest/protocol.py` must stay **byte-for-byte identical** (tag values,
@@ -187,11 +209,19 @@ Run: `uvicorn backend.main:app --port 8000` (repo root) + `npm run dev` in
      client_queue_max, messages_sent/dropped, connections_rejected, per-client
      detail) and `archive` (rows_written, queued, open_hours, segments_sealed,
      incomplete_hours, bus_drops, queue_drops, spool_bytes, last_fsync_at, ...).
+   - `POST /nodes/{node_id}/shutdown` -- body `{"confirm": true}`; sends the LoRa
+     shutdown command and WAITS (~10 s, like `/rescan`) for the real outcome:
+     `{node_id, outcome: acked|silent|not_received, attempts, message}`. 409 when the
+     secret is unset or the radio is disconnected, 404 unknown node, 422 without
+     `confirm`. `/live` is NOT involved. Reported in `GET /health` as `control`.
    - `PATCH /nodes/{node_id}` -- body `{"name": "..."}`, sets the display name,
      returns the updated node
    - `POST /rescan` -- re-runs the `serial_reader` CP2102 auto-detect
      (`SerialReader.request_rescan()`), waits a bounded window, returns
      `{ok, connected, port, last_error}`. Does not touch pyserial itself.
+   - WebSocket `/live/raw?node_id=...` (optional filter; cap `MAX_RAW_WS_CONNECTIONS`
+     default 8, close 1013): raw packet hex, control msgs `ready`/`gap`. Does NOT
+     alter `/live`. Reported in `GET /health` as `ws_raw`.
    - WebSocket: `/live?node_id=...` (omit `node_id` to receive all nodes).
      Beyond `MAX_WS_CONNECTIONS` (default 32) a new connection is refused with
      close code 1013. A data message carries no `type` key (unchanged contract:

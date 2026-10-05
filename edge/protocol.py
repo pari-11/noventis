@@ -34,11 +34,23 @@ MAX_PAYLOAD_LEN = 255                      # PAYLOAD_LEN is a single byte
 # ---- TLV tags (see docs/protocol-spec.md section 3) -------------------------
 TAG_TOF = 0x01         # LEN 2:  uint16 distance, millimetres
 TAG_IMU_6AXIS = 0x02   # LEN 12: 6x int16  ax,ay,az (accel), gx,gy,gz (gyro)
+# Control tags (spec section 8) -- NOT telemetry. CMD travels base -> node,
+# CMD_ACK node -> base. Consumers must keep them out of readings/charts/archive.
+TAG_CMD = 0x10         # LEN 14: node_id u8, action u8, counter u32, mac 8 bytes
+TAG_CMD_ACK = 0x11     # LEN 5:  action u8, counter u32
+
+ACTION_SHUTDOWN = 0x01  # the only action defined so far
 
 _TOF_VALUE_FMT = ">H"
 _IMU_VALUE_FMT = ">hhhhhh"
 _TOF_LEN = struct.calcsize(_TOF_VALUE_FMT)   # 2
 _IMU_LEN = struct.calcsize(_IMU_VALUE_FMT)   # 12
+_CMD_BODY_FMT = ">BBI"                       # node_id, action, counter (the MAC'd part)
+_CMD_BODY_LEN = struct.calcsize(_CMD_BODY_FMT)   # 6
+MAC_LEN = 8                                  # HMAC-SHA256 truncated to 8 bytes
+_CMD_LEN = _CMD_BODY_LEN + MAC_LEN           # 14
+_ACK_VALUE_FMT = ">BI"                       # action, counter
+_ACK_LEN = struct.calcsize(_ACK_VALUE_FMT)   # 5
 
 # Fixed-point scale factors: wire = int(physical * SCALE); physical = wire / SCALE
 ACCEL_SCALE = 100      # LSB per m/s^2
@@ -77,6 +89,8 @@ def encode_tlv(values):
       "tof_mm"    -> int millimetres                       (tag 0x01)
       "accel_mss" -> (x, y, z) floats in m/s^2             (tag 0x02, with gyro)
       "gyro_rads" -> (x, y, z) floats in rad/s             (tag 0x02, with accel)
+      "cmd"       -> (node_id, action, counter, mac8)      (tag 0x10, control)
+      "cmd_ack"   -> (action, counter)                     (tag 0x11, control)
 
     accel_mss and gyro_rads share one 0x02 record; if only one is supplied the
     other is packed as zeros. Scaling truncates toward zero to match firmware.
@@ -99,6 +113,17 @@ def encode_tlv(values):
             int(ax * ACCEL_SCALE), int(ay * ACCEL_SCALE), int(az * ACCEL_SCALE),
             int(gx * GYRO_SCALE), int(gy * GYRO_SCALE), int(gz * GYRO_SCALE),
         )
+
+    cmd = values.get("cmd")
+    if cmd is not None:    # (node_id, action, counter, mac) -- see build_command_frame
+        node_id, action, counter, mac = cmd
+        out += struct.pack(">BB", TAG_CMD, _CMD_LEN)
+        out += struct.pack(_CMD_BODY_FMT, node_id, action, counter) + bytes(mac)
+
+    ack = values.get("cmd_ack")
+    if ack is not None:    # (action, counter)
+        out += struct.pack(">BB", TAG_CMD_ACK, _ACK_LEN)
+        out += struct.pack(_ACK_VALUE_FMT, ack[0], ack[1])
     return bytes(out)
 
 
@@ -121,6 +146,15 @@ def decode_tlv(payload):
             ax, ay, az, gx, gy, gz = struct.unpack(_IMU_VALUE_FMT, chunk)
             values["accel_mss"] = [ax / ACCEL_SCALE, ay / ACCEL_SCALE, az / ACCEL_SCALE]
             values["gyro_rads"] = [gx / GYRO_SCALE, gy / GYRO_SCALE, gz / GYRO_SCALE]
+        elif tag == TAG_CMD and length == _CMD_LEN:
+            c_node, c_action, c_counter = struct.unpack(_CMD_BODY_FMT, chunk[:_CMD_BODY_LEN])
+            values["cmd"] = {
+                "node_id": c_node, "action": c_action,
+                "counter": c_counter, "mac": chunk[_CMD_BODY_LEN:],
+            }
+        elif tag == TAG_CMD_ACK and length == _ACK_LEN:
+            a_action, a_counter = struct.unpack(_ACK_VALUE_FMT, chunk)
+            values["cmd_ack"] = {"action": a_action, "counter": a_counter}
         # else: unknown tag or unexpected length -> skip (forward-compatible)
     return values
 
@@ -135,6 +169,53 @@ def build_frame(node_id, seq_num, values):
     )
     raw = header + payload  # CRC covers header (incl. SYNC) + payload
     return raw + struct.pack(">H", crc16(raw))
+
+
+def _hmac_sha256(key, msg):
+    """HMAC-SHA256 (RFC 2104) via hashlib only -- the `hmac` module is absent on
+    MicroPython. Imported lazily so this module still loads where hashlib is not."""
+    import hashlib
+    key = bytes(key)
+    if len(key) > 64:
+        key = hashlib.sha256(key).digest()
+    key = key + b"\x00" * (64 - len(key))
+    inner = hashlib.sha256(bytes(b ^ 0x36 for b in key) + bytes(msg)).digest()
+    return hashlib.sha256(bytes(b ^ 0x5C for b in key) + inner).digest()
+
+
+def command_mac(secret, node_id, action, counter):
+    """8-byte authentication code over (node_id, action, counter)."""
+    body = struct.pack(_CMD_BODY_FMT, node_id & 0xFF, action & 0xFF, counter & 0xFFFFFFFF)
+    return _hmac_sha256(secret, body)[:MAC_LEN]
+
+
+def verify_command(secret, cmd):
+    """True when `cmd` (the decoded "cmd" dict) carries a valid code for `secret`.
+
+    Authenticates only. The caller must ALSO check cmd["node_id"] is its own and
+    cmd["counter"] is greater than the last one it accepted (replay protection).
+    """
+    want = command_mac(secret, cmd["node_id"], cmd["action"], cmd["counter"])
+    got = bytes(cmd["mac"])
+    if len(got) != len(want):
+        return False
+    diff = 0
+    for a, b in zip(want, got):   # constant-time compare
+        diff |= a ^ b
+    return diff == 0
+
+
+def build_command_frame(secret, node_id, action, counter):
+    """Base -> node control frame addressed to `node_id` (header NODE_ID = target,
+    SEQ_NUM 0 -- the base has no telemetry sequence)."""
+    mac = command_mac(secret, node_id, action, counter)
+    return build_frame(node_id, 0, {"cmd": (node_id, action, counter, mac)})
+
+
+def build_ack_frame(node_id, seq_num, action, counter):
+    """Node -> base acknowledgement. Reuse the node's LAST telemetry seq_num so no
+    gap appears in the telemetry sequence."""
+    return build_frame(node_id, seq_num, {"cmd_ack": (action, counter)})
 
 
 def parse_frame(frame):
@@ -242,5 +323,20 @@ if __name__ == "__main__":
     _bad[-1] ^= 0xFF
     _bd = parse_frame(bytes(_bad))
     assert _bd.crc_ok is False and _bd.values == {}, _bd
+
+    # Control frames: command + ack round-trip; MAC accepts the right secret only.
+    _secret = b"correct horse battery staple"
+    _cf = parse_frame(build_command_frame(_secret, 1, ACTION_SHUTDOWN, 1234567))
+    assert _cf.crc_ok and _cf.node_id == 1 and _cf.seq_num == 0, _cf
+    _c = _cf.values["cmd"]
+    assert (_c["node_id"], _c["action"], _c["counter"]) == (1, ACTION_SHUTDOWN, 1234567), _c
+    assert verify_command(_secret, _c) is True
+    assert verify_command(b"wrong secret", _c) is False
+    _tampered = dict(_c)
+    _tampered["counter"] += 1                      # a replay with a bumped counter
+    assert verify_command(_secret, _tampered) is False
+    _af = parse_frame(build_ack_frame(1, 77, ACTION_SHUTDOWN, 1234567))
+    assert _af.crc_ok and _af.seq_num == 77, _af
+    assert _af.values == {"cmd_ack": {"action": ACTION_SHUTDOWN, "counter": 1234567}}, _af.values
 
     print("protocol.py self-test OK (byte-compatible with legacy):", _d.values)

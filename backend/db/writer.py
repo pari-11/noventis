@@ -170,6 +170,11 @@ class DBWriter:
                 )
 
     async def _persist(self, event: dict) -> None:
+        # Control frames (shutdown ACK etc.) are not telemetry: no reading, no
+        # last_seen bump, nothing. FIRST statement, before any DB work -- an ACK's
+        # values dict is non-empty, so without this it would be stored as a reading.
+        if event.get("control"):
+            return
         node_id = event["node_id"]
         received_at = event["received_at"]
         seq = event["seq_num"]
