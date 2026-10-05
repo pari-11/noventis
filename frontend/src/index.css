@@ -483,3 +483,14 @@ tbody tr:last-child td { border-bottom: none; }
 .power-acked { color: var(--up); }
 .power-silent { color: #f59e0b; }
 .power-not_received { color: var(--down); }
+
+/* spinner (NodePowerControl) -- ring in the accent colour; keyframes `spin` is shared */
+.spinner {
+  width: 16px; height: 16px; flex: none;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 800ms linear infinite;
+}
+/* shown in place of a node's graphs after its shutdown is acknowledged */
+.powered-off { text-align: center; padding: 56px 20px; }
+.powered-off h2 { margin: 0 0 10px; font-family: var(--font-serif); font-size: 22px; font-weight: 400; letter-spacing: 0.04em; }
+.powered-off p { margin: 4px 0; }

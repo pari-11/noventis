@@ -9,7 +9,10 @@
  *   acked         green  -- the node confirmed and is powering off
  *   silent        amber  -- no confirmation, but it stopped transmitting (probably off)
  *   not_received  red    -- it is still transmitting: the command did not get through
- * Once a node is off, only physically replugging power starts it again.
+ * Once a node is off, only physically replugging power starts it again. Pressing
+ * OK on an acked/silent result calls `onPoweredOff`, so the dashboard can swap the
+ * node's graphs for an "unreachable, please replug" card (App.tsx clears it again
+ * when the node transmits).
  */
 
 import { useEffect, useRef, useState } from 'react'
@@ -22,7 +25,15 @@ type State =
   | { kind: 'done'; outcome: Outcome; message: string }
   | { kind: 'error'; message: string }
 
-export function NodePowerControl({ nodeId, nodeName }: { nodeId: number; nodeName?: string }) {
+export function NodePowerControl({
+  nodeId,
+  nodeName,
+  onPoweredOff,
+}: {
+  nodeId: number
+  nodeName?: string
+  onPoweredOff: (nodeId: number) => void
+}) {
   const [state, setState] = useState<State>({ kind: 'idle' })
   const alive = useRef(true)
   useEffect(() => {
@@ -78,13 +89,24 @@ export function NodePowerControl({ nodeId, nodeName }: { nodeId: number; nodeNam
       )}
 
       {state.kind === 'sending' && (
-        <span className="small muted">Sending shutdown command to {label}… (up to 10 s)</span>
+        <>
+          <span className="spinner" role="status" aria-label="Shutting down" />
+          <span className="small muted">Sending shutdown command to {label}… (up to 10 s)</span>
+        </>
       )}
 
       {state.kind === 'done' && (
         <>
           <span className={`small power-${state.outcome}`}>{state.message}</span>
-          <button className="btn ghost-btn" onClick={() => setState({ kind: 'idle' })}>OK</button>
+          <button
+            className="btn"
+            onClick={() => {
+              if (state.outcome === 'acked' || state.outcome === 'silent') onPoweredOff(nodeId)
+              setState({ kind: 'idle' })
+            }}
+          >
+            OK
+          </button>
         </>
       )}
 

@@ -66,6 +66,10 @@ export default function App() {
   const [healthErr, setHealthErr] = useState<string | null>(null)
   const [nodes, setNodes] = useState<NodeInfo[]>([])
   const [now, setNow] = useState(() => Date.now())
+  // node_id -> when the operator acknowledged its shutdown (ms). While set, that
+  // node's graphs are replaced by an "unreachable, please replug" card. Cleared as
+  // soon as the node transmits again (effect below), so it can never get stuck.
+  const [poweredOff, setPoweredOff] = useState<Record<number, number>>({})
 
   // "View Raw data" is a hash route (#/raw) -- no router dependency, and the
   // browser Back button returns to the dashboard. The dashboard stays MOUNTED
@@ -157,6 +161,19 @@ export default function App() {
   }, [nodeId])
 
   useEffect(() => {
+    setPoweredOff((prev) => {
+      const back = Object.keys(prev).filter((k) => {
+        const n = nodes.find((x) => x.node_id === Number(k))
+        return n != null && new Date(n.last_seen).getTime() > prev[Number(k)]
+      })
+      if (back.length === 0) return prev
+      const next = { ...prev }
+      for (const k of back) delete next[Number(k)]
+      return next
+    })
+  }, [nodes])
+
+  useEffect(() => {
     if (nodeId != null) return
     const id = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(id)
@@ -236,7 +253,14 @@ export default function App() {
 
       <div hidden={rawView}>
       <NodeSelector value={nodeId} onChange={setNodeId} />
-      {nodeId != null && <NodePowerControl key={nodeId} nodeId={nodeId} nodeName={selectedName} />}
+      {nodeId != null && poweredOff[nodeId] == null && (
+        <NodePowerControl
+          key={nodeId}
+          nodeId={nodeId}
+          nodeName={selectedName}
+          onPoweredOff={(id) => setPoweredOff((p) => ({ ...p, [id]: Date.now() }))}
+        />
+      )}
 
       {nodeId == null ? (
         <main>
@@ -250,6 +274,14 @@ export default function App() {
               ))}
             </div>
           )}
+        </main>
+      ) : poweredOff[nodeId] != null ? (
+        <main>
+          <section className="card powered-off">
+            <h2>{selectedName ?? `Node ${nodeId}`} is unreachable</h2>
+            <p>Please unplug the Pi's power and plug it back in to start it again.</p>
+            <p className="muted small">This clears by itself as soon as the node starts transmitting.</p>
+          </section>
         </main>
       ) : (
         <main className="grid">
