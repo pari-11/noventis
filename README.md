@@ -43,6 +43,87 @@ docs/       architecture + wire-protocol spec (source of truth) + handover/
   loop. See "Storage, retention & backups" below and
   [docs/architecture.md](docs/architecture.md#archive-tier).
 
+## Quick start: run the whole system
+
+Three parts run together: the **backend** and the **dashboard** on the PC, and the
+**node script** on the Raspberry Pi. Details and every option are in "Run it" below.
+
+**Before you start**
+
+- Python 3 and Node.js are installed on the PC.
+- The LoRa gateway dongle (the CP2102 USB device, normally `COM4`) is plugged in.
+- Only one backend can run at a time -- `COM4` and port `8000` are exclusive. Close
+  any other backend window first.
+
+**1. Start the backend** (PowerShell, from the repo root -- not from `backend/`)
+
+```
+python -m venv .venv                       # first time only
+.venv\Scripts\activate
+pip install -r backend/requirements.txt    # first time only
+$env:NOVENTIS_CMD_SECRET = "your-secret"   # only needed for the Shut down button
+uvicorn backend.main:app --reload --port 8000
+```
+
+Leave this window open. The database is created on first start; nothing else to
+set up. The secret must be at least 8 characters, must match the one on the Pi,
+and only applies to the PowerShell window it was set in.
+
+**2. Check the backend is healthy**
+
+Open `http://localhost:8000/health`. You want `"lora": {"connected": true, ...}`.
+Interactive API docs: `http://localhost:8000/docs`.
+
+**3. Start the dashboard** (a second terminal)
+
+```
+cd frontend
+npm install        # first time only
+npm run dev
+```
+
+Open `http://localhost:5173`. The dev server forwards API and WebSocket traffic to
+port 8000.
+
+**4. Start the node (Raspberry Pi)**
+
+Power the Pi. The node script runs as the systemd service `noventis-tx` and starts
+on boot. To check it from SSH:
+
+```
+systemctl status noventis-tx.service --no-pager
+journalctl -u noventis-tx.service -n 15 --no-pager
+```
+
+You should see `TX Seq ...` lines, and the node appears on the dashboard a few
+seconds later. (First-time Pi setup, including the shutdown secret and sudo rule:
+[docs/architecture.md](docs/architecture.md#remote-shutdown-lora-downlink).)
+
+**5. Use it**
+
+- Select a node tab for live charts and history.
+- **View Raw data** shows every packet as hex (with filters and CSV download).
+- **Shut down node** powers the Pi off safely over LoRa. Only unplugging and
+  replugging its power starts it again.
+
+**6. Stop everything**
+
+Press Ctrl+C in the backend and dashboard windows. The Pi stays on until you shut
+it down.
+
+**If something doesn't work**
+
+| symptom | what to check |
+|---------|---------------|
+| "LoRa disconnected" | plug in the dongle, then click **Rescan for nodes** |
+| port 8000 or `COM4` "in use" | another backend is still running -- close it |
+| no nodes or readings | the Pi's service: run the commands in step 4 |
+| **Shut down node** says "not configured" | set `NOVENTIS_CMD_SECRET` in the same PowerShell window as `uvicorn`, then restart the backend |
+
+Optional: `python edge/protocol.py` runs the protocol self-test, and
+`git config core.hooksPath .githooks` (once per clone) enables the check that the
+two `protocol.py` files stay identical.
+
 ## Run it
 
 ### 1. Backend  (from the repo root, not `backend/`)
