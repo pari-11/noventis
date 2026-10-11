@@ -62,7 +62,12 @@ The full pipeline is built and covered by integration tests
 - `backend/ws/raw_manager.py` -- `/live/raw`: separate sibling of `ws/manager.py` (own
   `subscribe("ws-raw")`, own registry/outboxes, shares nothing with `/live`). Relays
   EVERY candidate frame (CRC pass+fail) as `{seq,node_id,seq_num,ts,crc_ok,raw_hex}`;
-  feeds the dashboard's "View Raw data" page (`#/raw`, `RawDataPage.tsx`)
+  feeds the dashboard's "View Raw data" page (`#/raw`, `RawDataPage.tsx`). On open and
+  on every (re)connect the page ALSO preloads the backend's in-memory ring via
+  `GET /debug/frames` (last `RAW_FRAME_BUFFER_SIZE`, default 5000) and merges it with
+  the live stream (de-duplicated by timestamp + bytes), so a refresh or the first
+  click shows the session's recent packets, not just those since the click. Cleared
+  only by a backend restart (the ring is memory-only); the browser keeps up to 5000.
 - `backend/control/shutdown.py` + `backend/api/power.py` -- **remote node shutdown over
   LoRa** (dashboard "Shut down node" button, `POST /nodes/{id}/shutdown`). An
   independent bus subscriber (`subscribe("control")`); sends an authenticated command

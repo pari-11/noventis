@@ -168,7 +168,7 @@ export function RawDataPage({ initialNodeId }: { initialNodeId: number | null })
           </thead>
           <tbody>
             {rows.map((p) => (
-              <tr key={p.seq} className={p.crc_ok ? '' : 'raw-row-fail'}>
+              <tr key={`${p.seq}-${p.ts}`} className={p.crc_ok ? '' : 'raw-row-fail'}>
                 <td>{timeOf(p.ts)}</td>
                 <td>{p.node_id ?? '—'}</td>
                 <td>{p.seq_num ?? '—'}</td>
