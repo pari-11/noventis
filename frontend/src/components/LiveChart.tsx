@@ -30,7 +30,7 @@
  * (~8190 mm) arrives flagged `tof_out_of_range`. Those points are NOT fed into
  * the ToF line as a distance -- in BOTH raw and smoothed views the line breaks
  * (whitespace gap) and a separate out-of-range overlay series (its own `--down`
- * colour, never the ToF / smoothed line colour) is drawn instead: dots for lone
+ * colour, never the series line colour) is drawn instead: dots for lone
  * sentinels, a joined segment for consecutive ones. One bogus reading can't
  * blow out the y-axis.
  *
@@ -141,8 +141,9 @@ function readChartColors(): ChartColors {
     gyro: v('--accent-2', fb.gyro),
   }
 }
-const lineColorFor = (c: ChartColors, key: SeriesKey, mode: Mode) =>
-  mode === 'smoothed' ? c.accent2 : c[key]
+// The line keeps its series colour in BOTH raw and smoothed views (smoothing is
+// already signalled by the Smoothed toggle and the legend note), so `_mode` is unused.
+const lineColorFor = (c: ChartColors, key: SeriesKey, _mode: Mode) => c[key]
 
 // Local-time formatters for the chart. No `timeZone` option -> the browser's
 // local zone, the same zone `Date#toLocaleTimeString()` uses for the "latest:"
@@ -262,7 +263,7 @@ function samplesFor(frames: Frame[], key: SeriesKey): { time: UTCTimestamp; valu
 type Props = { nodeId: number; nodeName?: string }
 
 export function LiveChart({ nodeId, nodeName }: Props) {
-  const { messages, last } = useWebSocket(nodeId, { bufferSize: WS_BUFFER })
+  const { messages, last } = useWebSocket(nodeId, { bufferSize: WS_BUFFER, seedFromHistory: true })
 
   // all selections are plain state on this always-mounted component, so
   // collapsing the chart never loses them (issue #2).

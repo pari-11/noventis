@@ -40,10 +40,65 @@ export type LiveMessage = {
 
 export type WsStatus = 'connecting' | 'open' | 'closed'
 
-type Options = { bufferSize?: number }
+type Options = {
+  bufferSize?: number
+  /**
+   * Opt-in (LiveChart only). Once per mount/node, also fetch the node's latest
+   * `bufferSize` stored readings (GET /readings) and merge them in front of the live
+   * stream, so the chart keeps its history across tab switches and refreshes like the
+   * History panel does. Off by default: every other caller behaves exactly as before.
+   */
+  seedFromHistory?: boolean
+}
+
+/** One row of GET /readings (full-resolution rows; `rollup` rows are never used). */
+export type ReadingRow = {
+  node_id: number
+  seq_num: number
+  timestamp: string
+  tof_mm: number | null
+  tof_out_of_range?: boolean | null
+  accel_x: number | null
+  accel_y: number | null
+  accel_z: number | null
+  gyro_x: number | null
+  gyro_y: number | null
+  gyro_z: number | null
+  rollup?: boolean
+}
+
+/** A stored reading -> the shape /live sends (so the chart code needs no changes). */
+export function readingToMessage(r: ReadingRow): LiveMessage {
+  const values: LiveMessage['values'] = {}
+  if (r.tof_mm != null) {
+    values.tof_mm = r.tof_mm
+    values.tof_out_of_range = !!r.tof_out_of_range
+  }
+  if (r.accel_x != null && r.accel_y != null && r.accel_z != null) {
+    values.accel_mss = [r.accel_x, r.accel_y, r.accel_z]
+  }
+  if (r.gyro_x != null && r.gyro_y != null && r.gyro_z != null) {
+    values.gyro_rads = [r.gyro_x, r.gyro_y, r.gyro_z]
+  }
+  return { node_id: r.node_id, seq_num: r.seq_num, ts: r.timestamp, values }
+}
+
+/** Put `seeded` (stored history) and `live` (already received) together: drop seeded
+ *  rows that are already live, keep time order, cap to the newest `cap`. Returns
+ *  `live` itself (same reference) when there is nothing new to add. */
+export function mergeSeed(live: LiveMessage[], seeded: LiveMessage[], cap: number): LiveMessage[] {
+  const have = new Set(live.map((m) => `${m.node_id}:${m.seq_num}`))
+  const older = seeded.filter((m) => !have.has(`${m.node_id}:${m.seq_num}`))
+  if (older.length === 0) return live
+  const decorated = older.concat(live).map((m) => [Date.parse(m.ts), m] as const)
+  decorated.sort((a, b) => a[0] - b[0]) // stable: equal timestamps keep seeded-first order
+  const all = decorated.map((d) => d[1])
+  return all.length > cap ? all.slice(all.length - cap) : all
+}
 
 export function useWebSocket(nodeId: number | null, opts: Options = {}) {
   const bufferSize = opts.bufferSize ?? 300
+  const seedFromHistory = opts.seedFromHistory ?? false
   const [status, setStatus] = useState<WsStatus>('connecting')
   const [messages, setMessages] = useState<LiveMessage[]>([])
   const [last, setLast] = useState<LiveMessage | null>(null)
@@ -55,6 +110,10 @@ export function useWebSocket(nodeId: number | null, opts: Options = {}) {
   const disposed = useRef(false)
   // Set by a `gap` control message, consumed by the next reading that arrives.
   const gapPending = useRef(false)
+  // Newest timestamp (epoch ms) covered by the seeded history. A live message at or
+  // before it is a duplicate of a seeded row (it was in the DB snapshot AND still in
+  // flight on the socket) and is dropped. -Infinity => seeding off: no effect at all.
+  const seedMaxTs = useRef(-Infinity)
 
   useEffect(() => {
     disposed.current = false
@@ -63,6 +122,33 @@ export function useWebSocket(nodeId: number | null, opts: Options = {}) {
     setDropped(0)
     gapPending.current = false
     retry.current = 0
+    seedMaxTs.current = -Infinity
+
+    // Best-effort, once per run: a failure just leaves the chart live-only as before.
+    let seedCancelled = false
+    let seedTimer: number | undefined
+    if (seedFromHistory && nodeId != null) {
+      fetch(`/readings?node_id=${nodeId}&limit=${bufferSize}`)
+        .then((r) => (r.ok ? (r.json() as Promise<ReadingRow[]>) : []))
+        .then((rows) => {
+          if (seedCancelled) return
+          const seeded = rows
+            .filter((r) => !r.rollup)
+            .reverse() // the API returns newest first
+            .map(readingToMessage)
+          if (seeded.length === 0) return
+          seedMaxTs.current = Math.max(...seeded.map((m) => Date.parse(m.ts)))
+          // The in-flight-duplicate race lasts about a second; expire the rule after
+          // 5 s so a stepped-back PC clock can never make it swallow live readings.
+          seedTimer = window.setTimeout(() => {
+            seedMaxTs.current = -Infinity
+          }, 5000)
+          setMessages((prev) => mergeSeed(prev, seeded, bufferSize))
+        })
+        .catch(() => {
+          /* live-only */
+        })
+    }
 
     const connect = () => {
       if (disposed.current) return
@@ -100,6 +186,7 @@ export function useWebSocket(nodeId: number | null, opts: Options = {}) {
         }
 
         const msg = data as LiveMessage
+        if (Date.parse(msg.ts) <= seedMaxTs.current) return // duplicate of a seeded row
         if (gapPending.current) {
           msg.gapBefore = true
           gapPending.current = false
@@ -126,12 +213,14 @@ export function useWebSocket(nodeId: number | null, opts: Options = {}) {
     connect()
 
     return () => {
+      seedCancelled = true
+      window.clearTimeout(seedTimer)
       disposed.current = true
       window.clearTimeout(timer.current)
       socket.current?.close()
       socket.current = null
     }
-  }, [nodeId, bufferSize])
+  }, [nodeId, bufferSize, seedFromHistory])
 
   return { status, messages, last, dropped }
 }

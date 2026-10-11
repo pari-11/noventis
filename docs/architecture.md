@@ -41,6 +41,9 @@ dashboard shows live and historical data.
 - `ws/raw_manager.py` -- **event-bus subscriber** (`"ws-raw"`), serving `WS /live/raw`:
   every candidate frame (CRC pass and fail) as hex, for the dashboard's raw-packet
   view. Fully independent of `ws/manager.py` / `/live` (own registry + outboxes).
+  The page also preloads `GET /debug/frames` (the in-memory ring) when it opens or
+  reconnects, so a refresh keeps the session's recent raw packets (until a backend
+  restart); live and preloaded packets are de-duplicated by timestamp + bytes.
 - `archive/writer.py`, `archive/store.py` -- **event-bus subscriber** (the
   fourth, alongside the three above). System of record: every CRC-valid
   reading, full resolution, forever, in `archive/` -- see "Archive tier" below.
